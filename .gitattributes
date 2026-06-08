@@ -1,0 +1,2 @@
+# Normalize line endings: store as LF in the repo, let Git handle the working tree.
+* text=auto eol=lf

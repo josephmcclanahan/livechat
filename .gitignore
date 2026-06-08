@@ -1,0 +1,18 @@
+# Dependencies
+node_modules/
+
+# Runtime data (channels, message logs, voice clips)
+data/
+
+# Local environment / secrets
+.env
+.env.local
+
+# Tooling & deploy config (personal)
+.azure/
+.claude/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.log
