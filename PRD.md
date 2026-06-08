@@ -80,6 +80,22 @@ A voice analog of the live text preview — a walkie-talkie inside each channel.
 
 **Graceful degradation**: true live-while-talking playback uses MediaSource Extensions (Chrome/Edge/Firefox, desktop + Android). On iOS Safari (no Opus/WebM recording, unreliable MSE-for-audio), the app still works as a radio — it shows the live indicator and **auto-plays the complete clip the instant the talker releases**. iOS records in `audio/mp4` so its clips save and play everywhere.
 
+| Convenience | Detail |
+|---|---|
+| Space shortcut | Holding the **Space** bar (when not typing in a field) acts as push-to-talk, like holding the mic button. |
+| Voice-first layout | A **profile → settings** toggle (persisted in `localStorage`) swaps the composer for a big centered record button above the message box — walkie-talkie over the thread. |
+| Custom player | Voice clips render with a minimal play/pause + seekable progress bar (no volume control — system volume governs); transcript sits inside the same bubble. |
+
+---
+
+## Additional Features
+
+| Feature | Detail |
+|---|---|
+| Delete a message | Right-click (desktop) or long-press (touch) **your own** message → Delete. Removes it for everyone (and deletes the media file for voice clips). Soft ownership check by client `userId` — a UX guard, not security. |
+| Time separators | iMessage-style headers appear between messages when a new cluster starts (first message, >15-min gap, or a new calendar day): "Today 12:30 PM", "Yesterday 8:00 AM", "Monday 5:12 PM", "Just now". |
+| Shareable channel URLs | The active channel is reflected in the URL hash (`#<channelId>`); a refresh stays in the channel, and back/forward navigate between channels. |
+
 ---
 
 ## Technical Approach (Prototype)
@@ -116,16 +132,19 @@ Although mobile-native is out of scope, the web app is built to feel right on to
 - Delete affordance is always visible on touch devices (not hover-only)
 - PTT mic button uses `touch-action: none` so press-and-hold drives recording without triggering scroll/zoom gestures
 - Voice falls back to auto-play-on-release on iOS Safari where live streaming playback isn't supported
+- Incoming clips auto-play through one gesture-unlocked audio element + a serial queue, so iOS plays them in order instead of blocking then flushing all at once
+- Long-press on your own message opens the delete menu (touch equivalent of right-click)
 
 ---
 
 ## Out of Scope (v1 Prototype)
 
-- User avatars or profile settings
-- Message editing or deletion
+- User avatars
+- Message editing
 - Read receipts
 - Push notifications
 - Any form of moderation
+- Real authentication/authorization (message deletion is a soft, client-asserted "your own" check, not enforced)
 - A database (flat files are sufficient)
 
 ---

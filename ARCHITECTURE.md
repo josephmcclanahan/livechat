@@ -72,6 +72,7 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | `ptt_start` | `{ mime }` | Begin a voice transmission; init transmit buffer; broadcast `ptt_start` to channel (excluding sender) |
 | `ptt_chunk` | `{ data }` | Base64 audio chunk; append to buffer + relay `ptt_chunk` to channel (excluding sender) |
 | `ptt_end` | — | Assemble buffer → write `media/<id>.<ext>`; append `audio` row; broadcast `message`; kick off async `transcribeClip` |
+| `delete_message` | `{ id }` | Delete that message **only if it belongs to the sender** (`removeOwnMessage`); rewrites the channel NDJSON without it (+ its transcript row), unlinks the media file, broadcasts `message_deleted` |
 
 **Server → Client**
 
@@ -85,6 +86,7 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | `ptt_chunk` | `{ userId, data }` | Live base64 audio chunk relayed from a transmitter |
 | `ptt_cancel` | `{ userId }` | Transmitter left/disconnected mid-clip, or the recording captured no audio — tear down live bubble + playback, no commit coming |
 | `transcript` | `{ id, text }` | A clip's transcript (from server-side Azure AI Speech) — patch it under the matching `#msg-<id>` bubble |
+| `message_deleted` | `{ id }` | Remove the `#msg-<id>` bubble for everyone |
 
 Voice chunks ride as base64 inside JSON messages (self-describing sender → trivial demux of simultaneous talkers), reusing the existing `broadcastToChannel` JSON path — no binary WebSocket frames. Full-duplex: no floor lock, anyone can transmit anytime. The `/media` directory is served statically (`app.use('/media', express.static(MEDIA_DIR))`).
 
@@ -115,6 +117,9 @@ let ws               // single WebSocket instance for the session
 let currentChannelId // id of the channel the user is currently viewing (null if none)
 let channels         // local cache of channel list
 let playbackMode     // voice playback: 'full' | 'onfinish' | 'off' (localStorage, default 'full')
+let voiceFirst       // big centered walkie-talkie composer layout (localStorage)
+let currentChannelName // name of the active channel (for re-rendering the composer)
+let lastMsgTs        // timestamp of the last rendered message (for time separators)
 ```
 
 ### Layout & Views
@@ -135,8 +140,14 @@ let playbackMode     // voice playback: 'full' | 'onfinish' | 'off' (localStorag
 **`openRoom(channelId, channelName)`**
 - Updates only the main content area (sidebar stays mounted)
 - On enter: sends `leave` for the previous channel if any, then `join` for the new one; `GET /api/channels/:id/messages` to load history
-- Renders: scrollable `.history` div + sticky `.msg-form` at the bottom
-- Input `input` event → `draft` WS message; form submit → `send` WS message + clear input + send empty `draft`
+- Renders: scrollable `.history` div + the composer (`composerMarkup` → `wireComposer`)
+- Sets the URL hash to `#<channelId>` so a refresh stays in the channel; resets `lastMsgTs` so the next message gets a time header
+
+**Composer (`composerMarkup` / `wireComposer` / `renderComposer`)**
+- Two layouts chosen by `voiceFirst`: normal inline (`[input] [🎙️] [Send]`), or **voice-first** (a big centered record button above the message box). `wireComposer` attaches the draft/submit/PTT listeners for either; `renderComposer` swaps the layout live when the setting is toggled.
+- Input `input` event → `draft` WS message; submit → `send` + clear + empty `draft`.
+
+**URL routing** — `openRoom` writes `location.hash`; on boot the hash selects the initial channel; a `hashchange` listener handles back/forward and manual edits; deleting the current channel clears the hash.
 
 ### Message & Draft Rendering
 
@@ -148,10 +159,12 @@ Drafts are rendered as chat bubbles **in** the history container — not a separ
   - Appends to the bottom of `.history`, scrolls into view
   - If `text === ""`, removes the bubble
 - `appendMessage(msg, { scroll, live })`:
-  - Branches on `msg.type === 'audio'` → renders an `<audio controls>` bubble (auto-plays only when `live && !isMine` and the clip wasn't already heard streaming); otherwise the text bubble
-  - If the sender had a draft/transmitting bubble, swaps it in-place via `replaceChild` (no visual jump)
-  - Otherwise, finds the first `.draft-bubble` and `insertBefore` — keeps drafts pinned to the bottom of the thread
-  - If no drafts, appends to the end
+  - Gives the bubble `id="msg-<id>"` + `data-userId` (+ `own` class) so the delete menu and transcript/delete events can target it
+  - Branches on `msg.type === 'audio'` → renders a **custom audio player** bubble (`setupAudioPlayer`): play/pause + seekable progress bar over a hidden `<audio>`, **no volume control** (system volume governs); transcript sits inside the same bubble. Auto-plays via the shared queue only when `live && !isMine` and not already heard streaming. Otherwise a text bubble.
+  - Calls `timeHeaderFor(msg)` and inserts an iMessage-style `.time-header` above the bubble when a new time cluster starts
+  - If the sender had a draft/transmitting bubble, swaps it in-place via `replaceChild`; otherwise `insertBefore` the first `.draft-bubble` (keeps drafts pinned to the bottom), else appends
+- `setupAudioPlayer(div, msgDuration)` — wires the custom player. WebM from `MediaRecorder` often lacks a duration header (`audio.duration` is `Infinity`), so it falls back to the server's measured `duration` and "primes" the real duration via a seek-to-end (so the progress bar moves from the first play and seeking is exact).
+- `timeHeaderFor(msg)` — returns a `.time-header` element (and advances `lastMsgTs`) when a message opens a new cluster: first message, **>15-min gap**, or a new calendar day. `formatTimeHeader` yields "Just now" / "Today 12:30 PM" / "Yesterday 8:00 AM" / "Monday 5:12 PM" / "Mar 29" via `toLocale*` (locale-aware).
 
 ### Push-to-Talk (voice)
 
@@ -161,7 +174,8 @@ Recording support is probed once at load (`pttMime` via `MediaRecorder.isTypeSup
 - **Transmit** — `startTransmit()` gets a **fresh** mic stream each hold, sends `ptt_start`, then base64-encodes each `ondataavailable` blob into a `ptt_chunk`. A promise chain (`chunkChain`) serializes encodes so `ptt_end` (from `recorder.onstop`) always follows the final chunk. On stop, `releaseMic()` stops the tracks — iOS otherwise keeps the mic hot (ducking/blocking incoming playback, Dynamic Island stays lit) and a cached track can silently die and record a 0 s clip. An empty recording sends `ptt_end` with no chunks; the server replies `ptt_cancel` to clear listeners' bubbles, and the transmitter sees a "Couldn't record" toast.
 - **Receive (live)** — `rxAudio` is a `Map<userId, ctx>`; on `ptt_start`, `startRx` opens a per-user `MediaSource` + `<audio autoplay>` **only for WebM the browser can decode**. Each `ptt_chunk` is `appendBuffer`'d. Simultaneous talkers each get their own context — full-duplex with zero extra coordination.
 - **Receive (fallback / iOS)** — for MP4 streams (or when `startRx` can't open one), live chunks are ignored and the committed clip **auto-plays on release** instead. A committed clip whose codec the device can't decode shows a "can't be played on this device" fallback instead of a broken player.
-- **Audio unlock + serial queue** — iOS only permits audio from a recent user gesture and blocks/queues a fresh `<audio>` each time (symptom: first clip plays, later ones don't, then all flush at once on the next gesture). So auto-play routes through **one persistent `player` element**, unlocked on the first `pointerdown`/PTT hold (`unlockAudio()` plays a silent clip on it), and a FIFO `playQueue` (`enqueuePlay`/`playNext`) plays clips one-at-a-time. Bubble `<audio controls>` (no `autoplay`) is still there for manual replay.
+- **Audio unlock + serial queue** — iOS only permits audio from a recent user gesture and blocks/queues a fresh `<audio>` each time (symptom: first clip plays, later ones don't, then all flush at once on the next gesture). So auto-play routes through **one persistent `player` element**, unlocked on the first `pointerdown`/PTT hold (`unlockAudio()` plays a silent clip on it), and a FIFO `playQueue` (`enqueuePlay`/`playNext`) plays clips one-at-a-time. The per-bubble hidden `<audio>` (driven by `setupAudioPlayer`) is still there for manual replay.
+- **Space-to-talk** — `setupSpacePtt()` makes holding the **Space** bar push-to-talk (when not typing in a field and in a channel), routing to the same `startTransmit`/`stopTransmit`.
 - **Transcript** — server-side (see `transcribeClip` in `server.js`). After a clip commits, the server POSTs the saved file to Azure AI Speech "fast transcription"; on success it appends a `transcript` row and broadcasts `transcript`. The client's `onTranscript` patches the text into `#msg-<id> .audio-transcript` (with a brief retry in case it beats the bubble). No client speech code — works on every browser/device, in-tenant.
 - **Live indicator** — `ptt_start` renders a `draft-${userId}` "🔴 transmitting…" bubble reusing the exact draft-bubble mechanism; the committed `audio` message swaps it in-place via the existing `replaceChild` path.
 - **Cleanup** — `finishRx` lets the buffered tail play out then releases the `MediaSource`; `ptt_cancel` (transmitter left mid-clip) tears down the context and removes the bubble.
@@ -194,9 +208,15 @@ function handleMessage(msg) {
     case 'ptt_start':       // show transmitting bubble + open live playback
     case 'ptt_chunk':       // append base64 audio to that user's MediaSource
     case 'ptt_cancel':      // tear down live bubble + playback (transmitter left)
+    case 'transcript':      // onTranscript() — patch text into the clip bubble
+    case 'message_deleted': // onMessageDeleted() — remove the bubble
   }
 }
 ```
+
+### Deleting messages
+
+`setupMessageMenu()` (one document-level handler) opens a small Delete menu on **right-click** (desktop) or **long-press** (touch) — but only over a message whose `data-userId` matches the local `userId`. Choosing Delete sends `delete_message { id }`; the server's `removeOwnMessage` re-checks ownership, rewrites the NDJSON without the message (and its transcript row), unlinks any media file, and broadcasts `message_deleted`. On touch, own messages get `-webkit-touch-callout: none` so the long-press doesn't trigger the iOS selection callout.
 
 ### iOS Keyboard Handling
 
@@ -245,4 +265,7 @@ Text rows have no `type` (implicitly `text`); audio rows carry `type:"audio"` + 
 - **Voice clips persist like text** — committed transmissions are `audio` rows in the same NDJSON and replay from `/media` on reload
 - **Transcripts are server-side** — the server transcribes each saved clip via Azure AI Speech and broadcasts the text; works on every device/browser, in-tenant; no-op if `AZURE_SPEECH_KEY`/`REGION` aren't set
 - **iOS auto-play is serialized** — incoming clips play through one gesture-unlocked element via a FIFO queue, so they play in order instead of being blocked then flushed all at once
+- **Delete is owner-only (soft)** — right-click/long-press your own message → `delete_message`; the server enforces a `userId` match before removing it and the media file, then broadcasts `message_deleted`. Client-asserted identity, so it's a UX guard, not security.
+- **Time separators are client-side** — `appendMessage` inserts an iMessage-style header when a message opens a new cluster (first, >15-min gap, or new day); computed at render time, not live-updating.
+- **Channel is in the URL** — the active channel lives in `location.hash`, so refresh stays put and channels are link-shareable; back/forward navigate.
 - **Reconnect re-identifies but does not re-join** — after a dropped WS connection, `identify` is re-sent on `onopen`, but the user must switch channels (or stay in their current channel — the local `currentChannelId` is preserved but the server-side `client.channelId` is reset) to resume receiving drafts. Known limitation, acceptable for prototype scope.
