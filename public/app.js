@@ -7,7 +7,10 @@ let channels = [];
 // Voice playback mode: 'full' = stream live as spoken, 'onfinish' = auto-play the whole clip on
 // release, 'off' = never auto-play (tap to play from history). Defaults to full.
 let playbackMode = localStorage.getItem('playbackMode') || 'full';
-let voiceFirst = localStorage.getItem('voiceFirst') === 'on'; // big centered walkie-talkie layout
+// Composer layout for the open room: big centered walkie-talkie (voice) or keyboard-forward
+// (chat). Seeded from the channel's defaultMode setting on open; the profile-menu toggle
+// overrides it live for the current room only.
+let voiceFirst = false;
 let currentChannelName = null;
 let lastMsgTs = null; // timestamp of the last rendered message, for iMessage-style time headers
 
@@ -167,11 +170,11 @@ function setupProfileMenu() {
     }
   });
 
+  // Live override of the current room's layout; openRoom re-seeds it from the channel's default.
   const vf = document.getElementById('voice-first-toggle');
   vf.checked = voiceFirst;
   vf.addEventListener('change', () => {
     voiceFirst = vf.checked;
-    localStorage.setItem('voiceFirst', voiceFirst ? 'on' : 'off');
     renderComposer(); // re-render the current room's composer live
   });
 }
@@ -213,23 +216,75 @@ function setActiveChannel(channelId) {
   if (li) li.querySelector('.channel-btn').classList.add('active');
 }
 
+// New-channel dialog: asks for the channel's settings — name and default mode (voice first
+// or chat first) — before creating it.
 function createChannel() {
-  const name = prompt('Channel name:');
-  if (!name || !name.trim()) return;
-  fetch('/api/channels', {
-    method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name: name.trim() })
-  })
-    .then(r => r.json())
-    .then(channel => {
-      document.getElementById('sidebar').classList.remove('open');
-      openRoom(channel.id, channel.name);
-    });
+  document.getElementById('channel-modal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'channel-modal';
+  overlay.innerHTML = `
+    <form class="modal" id="channel-form">
+      <h2>New channel</h2>
+      <label class="modal-label" for="channel-name-input">Name</label>
+      <input id="channel-name-input" type="text" maxlength="32" placeholder="e.g. general" autocomplete="off" />
+      <span class="modal-label">Default mode</span>
+      <div class="mode-options">
+        <label class="mode-option">
+          <input type="radio" name="default-mode" value="chat" checked />
+          <span class="mode-option-body">
+            <strong>💬 Chat first</strong>
+            <small>Message box up front, mic alongside</small>
+          </span>
+        </label>
+        <label class="mode-option">
+          <input type="radio" name="default-mode" value="voice" />
+          <span class="mode-option-body">
+            <strong>🎙️ Voice first</strong>
+            <small>Big push-to-talk button over the thread</small>
+          </span>
+        </label>
+      </div>
+      <div class="modal-actions">
+        <button type="button" class="modal-cancel" id="channel-cancel">Cancel</button>
+        <button type="submit">Create</button>
+      </div>
+    </form>
+  `;
+  document.body.appendChild(overlay);
+
+  const form = overlay.querySelector('#channel-form');
+  const nameInput = overlay.querySelector('#channel-name-input');
+  nameInput.focus();
+
+  const close = () => overlay.remove();
+  overlay.querySelector('#channel-cancel').addEventListener('click', close);
+  overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) close(); });
+  overlay.addEventListener('keydown', (e) => { if (e.key === 'Escape') close(); });
+
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    const name = nameInput.value.trim();
+    if (!name) { nameInput.focus(); return; }
+    const defaultMode = form.querySelector('input[name="default-mode"]:checked').value;
+    fetch('/api/channels', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ name, defaultMode })
+    })
+      .then(r => r.json())
+      .then(channel => {
+        close();
+        onChannelCreated(channel); // don't wait on the WS broadcast — openRoom needs the settings
+        document.getElementById('sidebar').classList.remove('open');
+        openRoom(channel.id, channel.name);
+      });
+  });
 }
 
 function onChannelCreated(channel) {
-  channels.push(channel);
+  // The creator hears about the channel twice (POST response + WS broadcast) — add it once.
+  if (!channels.find(c => c.id === channel.id)) channels.push(channel);
   addChannelToSidebar(channel);
 }
 
@@ -255,6 +310,12 @@ function openRoom(channelId, channelName) {
   currentChannelName = channelName;
   setActiveChannel(channelId);
   if (location.hash.slice(1) !== channelId) location.hash = channelId; // so a refresh stays here
+
+  // Start the composer in the channel's default mode (channels predating the setting → chat).
+  const channel = channels.find(c => c.id === channelId);
+  voiceFirst = (channel?.defaultMode || 'chat') === 'voice';
+  const vfToggle = document.getElementById('voice-first-toggle');
+  if (vfToggle) vfToggle.checked = voiceFirst;
 
   document.getElementById('room-title').textContent = `# ${channelName}`;
 

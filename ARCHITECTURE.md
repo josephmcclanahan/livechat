@@ -54,7 +54,7 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | Method | Path | Description |
 |--------|------|-------------|
 | `GET` | `/api/channels` | Return full channel list |
-| `POST` | `/api/channels` | Create channel `{ name }` → channel object; broadcasts `channel_created` to all WS clients |
+| `POST` | `/api/channels` | Create channel `{ name, defaultMode }` → channel object; `defaultMode` is `'voice'` or `'chat'` (anything else → `'chat'`); broadcasts `channel_created` to all WS clients |
 | `DELETE` | `/api/channels/:id` | Remove channel from list, delete its NDJSON file, broadcast `channel_deleted` to all WS clients |
 | `GET` | `/api/channels/:id/messages` | Return last 200 messages from NDJSON file |
 
@@ -80,7 +80,7 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 |--------|---------|------|
 | `draft_update` | `{ userId, name, text }` | On every `draft`; `text: ""` signals removal |
 | `message` | `{ message: { id, userId, name, text, timestamp } }` or `{ message: { id, type:'audio', userId, name, url, mime, duration, timestamp } }` | When a text message is sent or a voice clip is committed |
-| `channel_created` | `{ channel: { id, name, createdAt } }` | When any client creates a channel |
+| `channel_created` | `{ channel: { id, name, defaultMode, createdAt } }` | When any client creates a channel |
 | `channel_deleted` | `{ channelId }` | When any client deletes a channel |
 | `ptt_start` | `{ userId, name, mime }` | Another user began transmitting — show live bubble + prep playback |
 | `ptt_chunk` | `{ userId, data }` | Live base64 audio chunk relayed from a transmitter |
@@ -117,7 +117,7 @@ let ws               // single WebSocket instance for the session
 let currentChannelId // id of the channel the user is currently viewing (null if none)
 let channels         // local cache of channel list
 let playbackMode     // voice playback: 'full' | 'onfinish' | 'off' (localStorage, default 'full')
-let voiceFirst       // big centered walkie-talkie composer layout (localStorage)
+let voiceFirst       // composer layout for the open room — seeded from the channel's defaultMode
 let currentChannelName // name of the active channel (for re-rendering the composer)
 let lastMsgTs        // timestamp of the last rendered message (for time separators)
 ```
@@ -134,17 +134,18 @@ let lastMsgTs        // timestamp of the last rendered message (for time separat
 - Main area starts in `.welcome-state` (prompt to pick a channel)
 - Fetches `/api/channels` once and populates the sidebar
 - Sidebar opens/closes via hamburger on narrow screens
-- `+ Add Channel` button → `POST /api/channels` → opens new channel immediately
+- `+ Add Channel` button → a modal dialog collects the channel's settings (name + default mode: chat first / voice first) → `POST /api/channels` → opens new channel immediately (the creator adds the channel from the POST response; `onChannelCreated` dedupes against the WS broadcast)
 - Each channel row has a `×` delete button → `DELETE /api/channels/:id` (with `confirm()`)
 
 **`openRoom(channelId, channelName)`**
 - Updates only the main content area (sidebar stays mounted)
 - On enter: sends `leave` for the previous channel if any, then `join` for the new one; `GET /api/channels/:id/messages` to load history
 - Renders: scrollable `.history` div + the composer (`composerMarkup` → `wireComposer`)
+- Seeds `voiceFirst` from the channel's `defaultMode` setting (`'voice'` → voice-first composer; missing/`'chat'` → keyboard-forward) and syncs the profile-menu toggle to match
 - Sets the URL hash to `#<channelId>` so a refresh stays in the channel; resets `lastMsgTs` so the next message gets a time header
 
 **Composer (`composerMarkup` / `wireComposer` / `renderComposer`)**
-- Two layouts chosen by `voiceFirst`: normal inline (`[input] [🎙️] [Send]`), or **voice-first** (a big centered record button above the message box). `wireComposer` attaches the draft/submit/PTT listeners for either; `renderComposer` swaps the layout live when the setting is toggled.
+- Two layouts chosen by `voiceFirst`: normal inline (`[input] [🎙️] [Send]`), or **voice-first** (a big centered record button above the message box). `voiceFirst` starts from the channel's `defaultMode` on room open; the profile-menu toggle overrides it live for the current room (not persisted). `wireComposer` attaches the draft/submit/PTT listeners for either; `renderComposer` swaps the layout live when the toggle changes.
 - Input `input` event → `draft` WS message; submit → `send` + clear + empty `draft`.
 
 **URL routing** — `openRoom` writes `location.hash`; on boot the hash selects the initial channel; a `hashchange` listener handles back/forward and manual edits; deleting the current channel clears the hash.
@@ -234,7 +235,7 @@ The combination keeps the header anchored at the top while the input + history c
 **`data/channels.json`**
 ```json
 [
-  { "id": "f3a1b2c4", "name": "general", "createdAt": "2026-03-29T12:00:00.000Z" }
+  { "id": "f3a1b2c4", "name": "general", "defaultMode": "chat", "createdAt": "2026-03-29T12:00:00.000Z" }
 ]
 ```
 

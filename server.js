@@ -139,7 +139,10 @@ app.get('/api/channels', (req, res) => {
 app.post('/api/channels', (req, res) => {
   const name = (req.body.name || '').trim();
   if (!name) return res.status(400).json({ error: 'Name required' });
-  const channel = { id: crypto.randomUUID().slice(0, 8), name, createdAt: new Date().toISOString() };
+  // Channel setting: which composer layout the channel opens in — 'voice' (big push-to-talk
+  // button) or 'chat' (keyboard-forward). Anything unexpected falls back to 'chat'.
+  const defaultMode = req.body.defaultMode === 'voice' ? 'voice' : 'chat';
+  const channel = { id: crypto.randomUUID().slice(0, 8), name, defaultMode, createdAt: new Date().toISOString() };
   channels.push(channel);
   saveChannels();
   broadcastToAll({ type: 'channel_created', channel });
