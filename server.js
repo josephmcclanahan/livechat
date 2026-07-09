@@ -278,7 +278,10 @@ wss.on('connection', (ws) => {
         // wait for the committed clip.
         broadcastToChannel(client.channelId, {
           type: 'ptt_start', userId: client.userId, name: client.name, mime: client.audioMime,
-          live: !!msg.live, rate: Number(msg.rate) || 0
+          live: !!msg.live, rate: Number(msg.rate) || 0,
+          // Listeners decode frames per this codec — dropping it here once made them read
+          // µ-law bytes as Int16 PCM (ear-splitting noise).
+          codec: typeof msg.codec === 'string' ? msg.codec.slice(0, 16) : undefined
         }, ws);
         break;
       }

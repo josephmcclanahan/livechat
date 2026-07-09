@@ -1104,6 +1104,7 @@ function startRx(uid, rate, codec) {
   __lc.rxLead = rxLead;
   const gain = ctx.createGain();
   gain.connect(ctx.destination);
+  __lc.rxCodec = codec; // what the last live stream advertised — undefined means Int16
   rxAudio.set(uid, { gain, rate, codec, nextTime: 0, started: false, pending: [] });
 }
 
@@ -1140,6 +1141,13 @@ function onLiveFrame(buf) {
     ch = new Float32Array(pcm.length);
     for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
   }
+  // Roughness diagnostic: mean |sample-to-sample jump| per frame. Real audio reads well
+  // under 0.2 (occasional clicks barely move a mean); a codec mismatch (µ-law read as
+  // Int16, or vice versa) decodes to white noise and reads ~0.6+.
+  let rough = 0;
+  for (let i = 1; i < ch.length; i++) rough += Math.abs(ch[i] - ch[i - 1]);
+  rough /= Math.max(1, ch.length - 1);
+  if (!(__lc.rxRough >= rough)) __lc.rxRough = rough;
   const ab = audioCtx.createBuffer(1, ch.length, rx.rate);
   ab.getChannelData(0).set(ch);
   __lc.framesHeard++;
