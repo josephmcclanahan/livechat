@@ -1,6 +1,7 @@
 // AudioWorklet processor for the live voice path: captures mic audio at the context's
-// native rate, resamples it to a fixed low rate, and posts fixed-size Int16 PCM frames
-// to the main thread. Raw PCM frames need no container, so — unlike MediaRecorder
+// native rate, resamples it to a fixed low rate, and posts fixed-size µ-law (G.711)
+// frames to the main thread — 1 byte/sample, half the bandwidth of Int16 at telephone
+// quality. Containerless frames need no codec negotiation, so — unlike MediaRecorder
 // output — they can be relayed and played mid-stream on every browser, including iOS.
 
 class PcmCaptureProcessor extends AudioWorkletProcessor {
@@ -22,8 +23,21 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     this.raw = new Float32Array(8192);        // unconsumed input samples
     this.rawLen = 0;
     this.readPos = 0;                         // fractional resample cursor into `raw`
-    this.frame = new Int16Array(this.frameSize);
+    this.frame = new Uint8Array(this.frameSize);
     this.frameLen = 0;
+  }
+
+  // Standard G.711 µ-law: sign + 3-bit exponent + 4-bit mantissa, bias 132.
+  static ulaw(sample) {
+    let s = Math.max(-32768, Math.min(32767, Math.round(sample * 32767)));
+    const sign = s < 0 ? 0x80 : 0;
+    if (s < 0) s = -s;
+    s += 132;
+    if (s > 32767) s = 32767;
+    let exp = 7;
+    for (let mask = 0x4000; (s & mask) === 0 && exp > 0; exp--, mask >>= 1) {}
+    const mant = (s >> (exp + 3)) & 0x0f;
+    return ~(sign | (exp << 4) | mant) & 0xff;
   }
 
   process(inputs) {
@@ -44,11 +58,11 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
       const i = Math.floor(this.readPos);
       const frac = this.readPos - i;
       const s = this.raw[i] + (this.raw[i + 1] - this.raw[i]) * frac;
-      this.frame[this.frameLen++] = Math.max(-32768, Math.min(32767, Math.round(s * 32767)));
+      this.frame[this.frameLen++] = PcmCaptureProcessor.ulaw(s);
       if (this.frameLen === this.frameSize) {
         const out = this.frame;
         this.port.postMessage(out, [out.buffer]);
-        this.frame = new Int16Array(this.frameSize);
+        this.frame = new Uint8Array(this.frameSize);
         this.frameLen = 0;
       }
       this.readPos += this.step;

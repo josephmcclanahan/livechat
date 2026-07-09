@@ -72,7 +72,7 @@ DEPLOY.md           # Azure deployment guide
 
 This is a prototype, by design:
 
-- **Live voice is phone-call quality.** The live stream is raw mono 16 kHz PCM (~32 KB/s per talker) scheduled through Web Audio — universal and low-latency, but uncompressed; weak cellular uplinks may stutter. The saved clip is always full quality. (Committed clips still need a codec the listening device can decode.)
+- **Live voice is phone-call quality.** The live stream is mono 16 kHz µ-law (~16 KB/s per talker) scheduled through Web Audio — universal and low-latency; on a congested uplink frames are shed rather than delayed, so weak connections lose moments of live audio instead of garbling it. The saved clip is always full quality. (Committed clips still need a codec the listening device can decode.)
 - **"Delete your own message"** is matched by a client-supplied user ID — a UX guard, not real security (the app is intentionally auth-less).
 - **Single instance only.** The in-memory relay + flat files don't scale horizontally; multiplying instances would need a pub/sub backplane and shared storage.
 
