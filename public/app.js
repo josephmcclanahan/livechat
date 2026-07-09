@@ -781,27 +781,40 @@ const LIVE_FRAME = 960;  // samples per binary frame (60 ms at 16 kHz)
 const __lc = { framesSent: 0, framesHeard: 0, underruns: 0 };
 window.__lc = __lc;
 
-// One shared AudioContext drives both live capture (worklet) and live playback (scheduled
-// buffers). iOS creates it 'suspended' until a user gesture resumes it — unlockAudio()
-// takes care of that on the first touch.
+// One shared AudioContext drives live playback (capture gets its own per hold — see
+// startLiveTx). iOS creates it 'suspended' until a user gesture resumes it, and flips it
+// to 'interrupted' when the audio session changes (e.g. after a recording) — unlockAudio()
+// and startRx() both re-kick it.
 let audioCtx = null;
-let workletReady = null;
 
 function getAudioCtx() {
   const AC = window.AudioContext || window.webkitAudioContext;
   if (!AC) return null;
   if (!audioCtx) audioCtx = new AC();
-  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
   return audioCtx;
 }
 
-function ensureWorklet() {
+// Live playback routes through a persistent, gesture-unlocked <audio> element fed by a
+// MediaStreamAudioDestinationNode — NOT through ctx.destination. iOS mutes Web Audio's
+// output channel with the ring/silent switch, but media-element playback ignores the
+// switch — the same reason committed clips play through the unlocked `player` element.
+let liveDest = null; // all rx gains connect into this
+let liveOut = null;  // <audio> playing liveDest.stream (silence when nobody transmits)
+
+function getLiveDest() {
   const ctx = getAudioCtx();
-  if (!ctx || !ctx.audioWorklet) return Promise.resolve(false);
-  if (!workletReady) {
-    workletReady = ctx.audioWorklet.addModule('pcm-capture-worklet.js').then(() => true, () => false);
+  if (!ctx) return null;
+  if (!liveDest) {
+    try { liveDest = ctx.createMediaStreamDestination(); } catch { return null; }
+    liveOut = new Audio();
+    liveOut.setAttribute('playsinline', '');
+    liveOut.srcObject = liveDest.stream;
   }
-  return workletReady;
+  // (Re)start best-effort on every call: needs a gesture once, and iOS pauses the
+  // element when the audio session is interrupted.
+  liveOut.play().catch(() => {});
+  return liveDest;
 }
 
 let micStream = null;
@@ -825,7 +838,7 @@ let playing = false;
 const SILENT_CLIP = 'data:audio/mp4;base64,AAAAHGZ0eXBNNEEgAAAAAE00QSBpc29tbXA0MgAAAAhmcmVlAAAAGm1kYXQAAAAA';
 let audioUnlocked = false;
 function unlockAudio() {
-  getAudioCtx(); // create/resume the AudioContext while we hold a user gesture
+  getLiveDest(); // create/resume the AudioContext + live output element during a gesture
   if (audioUnlocked) return;
   audioUnlocked = true;
   try {
@@ -878,7 +891,7 @@ async function startTransmit() {
   }
   if (!transmitting) { releaseMic(); return; } // released before permission resolved
 
-  const liveOk = await ensureWorklet(); // instant after the first hold
+  const liveOk = await startLiveTx(); // builds the capture pipeline; false → clip-only
   if (!transmitting) { releaseMic(); return; }
 
   wsSend({ type: 'ptt_start', mime: pttMime, live: liveOk, rate: LIVE_RATE });
@@ -911,10 +924,24 @@ async function startTransmit() {
 // Mic → worklet (resample to LIVE_RATE Int16 frames) → binary WS frames. The worklet's
 // output is muted into the destination only to keep the graph pulled — nothing is audible
 // locally.
-function startLiveTx() {
-  const ctx = getAudioCtx();
-  if (!ctx || !micStream) return;
+//
+// Capture gets a FRESH AudioContext per hold, created only after getUserMedia resolves:
+// a context's sampleRate is locked at creation, but iOS re-configures the hardware rate
+// when the mic session starts (e.g. 48 kHz → 24 kHz on some routes). Capturing through a
+// context created before the mic ran means the worklet resamples from the wrong input
+// rate — audio arrives at half/double speed. Returns false if the live path is
+// unavailable (listeners then fall back to the committed clip).
+async function startLiveTx() {
+  if (!micStream) return false;
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return false;
+  let ctx = null;
   try {
+    ctx = new AC();
+    if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') throw new Error('no worklet');
+    if (ctx.state !== 'running') ctx.resume().catch(() => {});
+    await ctx.audioWorklet.addModule('pcm-capture-worklet.js');
+    if (!transmitting || !micStream) throw new Error('released during setup');
     const src = ctx.createMediaStreamSource(micStream);
     const node = new AudioWorkletNode(ctx, 'pcm-capture', {
       processorOptions: { targetRate: LIVE_RATE, frameSize: LIVE_FRAME }
@@ -933,9 +960,12 @@ function startLiveTx() {
     src.connect(node);
     node.connect(mute);
     mute.connect(ctx.destination);
-    liveTx = { src, node, mute };
+    liveTx = { ctx, src, node, mute };
+    return true;
   } catch {
-    liveTx = null; // listeners fall back to hearing the committed clip
+    try { if (ctx) ctx.close(); } catch {}
+    liveTx = null;
+    return false;
   }
 }
 
@@ -945,6 +975,7 @@ function stopLiveTx() {
   try { liveTx.src.disconnect(); } catch {}
   try { liveTx.node.disconnect(); } catch {}
   try { liveTx.mute.disconnect(); } catch {}
+  try { liveTx.ctx.close(); } catch {}
   liveTx = null;
 }
 
@@ -1017,7 +1048,10 @@ function startRx(uid, rate) {
   teardownRx(uid);
   rxLead = Math.max(RX_MIN_LEAD, rxLead * 0.9);
   const gain = ctx.createGain();
-  gain.connect(ctx.destination);
+  // Through the media element (iOS silent switch mutes ctx.destination); direct only as
+  // a last resort.
+  const dest = getLiveDest();
+  gain.connect(dest || ctx.destination);
   rxAudio.set(uid, { gain, rate, nextTime: 0, started: false, pending: [] });
 }
 
