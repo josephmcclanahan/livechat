@@ -7,7 +7,7 @@ No accounts, no database, no build step. Just enter a name and chat.
 ## Features
 
 - **Live message previews** — drafts appear as a chat bubble and update keystroke-by-keystroke; on send they lock in place.
-- **Push-to-talk voice** — hold the mic button (or **Space**) to talk. Others hear it streaming live (where supported), and the clip is saved to history as a slim, seekable player.
+- **Push-to-talk voice** — hold the mic button (or **Space**) to talk. Others hear it streaming live on every modern browser — iOS included, both talking and listening — and the clip is saved to history as a slim, seekable player.
 - **Voice-first layout** — a big centered record button over the thread (toggle under **profile → settings**).
 - **Auto transcripts** — each voice clip is transcribed server-side via Azure AI Speech and shown under the bubble (optional; off if not configured).
 - **Multiple channels** — anyone can create or delete them.
@@ -72,7 +72,7 @@ DEPLOY.md           # Azure deployment guide
 
 This is a prototype, by design:
 
-- **iOS plays voice on release, not live.** iPhones record and post fine (others hear them live), but an iPhone *listener* hears incoming clips once they're sent, not streaming — Safari can't reliably stream-decode the audio. Other devices get true live playback.
+- **Live voice is phone-call quality.** The live stream is raw mono 16 kHz PCM (~32 KB/s per talker) scheduled through Web Audio — universal and low-latency, but uncompressed; weak cellular uplinks may stutter. The saved clip is always full quality. (Committed clips still need a codec the listening device can decode.)
 - **"Delete your own message"** is matched by a client-supplied user ID — a UX guard, not real security (the app is intentionally auth-less).
 - **Single instance only.** The in-memory relay + flat files don't scale horizontally; multiplying instances would need a pub/sub backplane and shared storage.
 

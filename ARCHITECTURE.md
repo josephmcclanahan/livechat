@@ -9,6 +9,7 @@ LiveChat/
   public/
     index.html           # App shell
     app.js               # All frontend logic — views + WS client
+    pcm-capture-worklet.js  # AudioWorklet: mic → 16 kHz Int16 PCM frames (live voice path)
     style.css
   ${DATA_DIR}/           # Auto-created at startup; defaults to ./data, /home/data on Azure
     channels.json        # Ordered list of channel objects
@@ -70,9 +71,10 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | `leave` | — | Clear client's channel; broadcast empty draft to clear their row for others |
 | `draft` | `{ text }` | Update `drafts` map; broadcast `draft_update` to channel (excluding sender) |
 | `send` | `{ text }` | Append message to NDJSON; broadcast `message` to channel; clear draft |
-| `ptt_start` | `{ mime }` | Begin a voice transmission; init transmit buffer; broadcast `ptt_start` to channel (excluding sender) |
-| `ptt_chunk` | `{ data }` | Base64 audio chunk; append to buffer + relay `ptt_chunk` to channel (excluding sender) |
+| `ptt_start` | `{ mime, live, rate }` | Begin a voice transmission; init transmit buffer; broadcast `ptt_start` to channel (excluding sender). `live`/`rate` advertise the talker's PCM stream (absent if the browser lacks AudioWorklet) |
+| `ptt_chunk` | `{ data }` | Base64 **archive** chunk (MediaRecorder output); append to the transmit buffer only — never relayed |
 | `ptt_end` | — | Assemble buffer → write `media/<id>.<ext>`; append `audio` row; broadcast `message`; kick off async `transcribeClip` |
+| *(binary frame)* | `[0x01][Int16 PCM]` | Live audio frame (mono, `rate` Hz, ~60 ms). Relayed to the channel with the sender's userId spliced in; never parsed or persisted. Dropped unless a transmission is open; capped at 32 KB |
 | `delete_message` | `{ id }` | Delete that message **only if it belongs to the sender** (`removeOwnMessage`); rewrites the channel NDJSON without it (+ its transcript row), unlinks the media file, broadcasts `message_deleted` |
 
 **Server → Client**
@@ -84,13 +86,13 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | `channel_created` | `{ channel: { id, name, defaultMode, createdAt } }` | When any client creates a channel |
 | `channel_updated` | `{ channel: { id, name, defaultMode, createdAt } }` | When any client edits a channel's settings |
 | `channel_deleted` | `{ channelId }` | When any client deletes a channel |
-| `ptt_start` | `{ userId, name, mime }` | Another user began transmitting — show live bubble + prep playback |
-| `ptt_chunk` | `{ userId, data }` | Live base64 audio chunk relayed from a transmitter |
+| `ptt_start` | `{ userId, name, mime, live, rate }` | Another user began transmitting — show live bubble; if `live`, open a jitter-buffered Web Audio stream at `rate` Hz |
+| *(binary frame)* | `[0x01][uidLen:u8][uid utf8][Int16 PCM]` | Live PCM frame relayed from a transmitter — decode the uid header, schedule the samples into that talker's stream |
 | `ptt_cancel` | `{ userId }` | Transmitter left/disconnected mid-clip, or the recording captured no audio — tear down live bubble + playback, no commit coming |
 | `transcript` | `{ id, text }` | A clip's transcript (from server-side Azure AI Speech) — patch it under the matching `#msg-<id>` bubble |
 | `message_deleted` | `{ id }` | Remove the `#msg-<id>` bubble for everyone |
 
-Voice chunks ride as base64 inside JSON messages (self-describing sender → trivial demux of simultaneous talkers), reusing the existing `broadcastToChannel` JSON path — no binary WebSocket frames. Full-duplex: no floor lock, anyone can transmit anytime. The `/media` directory is served statically (`app.use('/media', express.static(MEDIA_DIR))`).
+Live audio rides as raw binary WebSocket frames — no base64 (~33% smaller, no main-thread encode), no container, and the server treats the payload as opaque bytes. The uid header the server splices in makes each frame self-describing, so simultaneous talkers demux trivially. Archive chunks stay as base64-in-JSON since they're upload-only and low-rate. Full-duplex: no floor lock, anyone can transmit anytime. The `/media` directory is served statically (`app.use('/media', express.static(MEDIA_DIR))`).
 
 ### Disk Persistence
 
@@ -175,17 +177,21 @@ Drafts are rendered as chat bubbles **in** the history container — not a separ
 
 Recording support is probed once at load (`pttMime` via `MediaRecorder.isTypeSupported`, preferring `audio/webm;codecs=opus`, falling back to `audio/mp4`); the PTT button hides entirely if unsupported.
 
-- **Codec split** — only **WebM** (Opus) concatenates into a valid file from `MediaRecorder` timeslice fragments *and* streams via MSE, so WebM records with a 250 ms timeslice for true live streaming. **MP4** (iOS Safari) does **not** produce valid streamable fragments — appending them to a `SourceBuffer` chops/skips and concatenating them yields a corrupt file — so MP4 records in **one piece** (`recorder.start()` with no timeslice): a single complete, valid clip emitted on stop (no live audio from iOS; listeners hear it on release).
-- **Transmit** — `startTransmit()` gets a **fresh** mic stream each hold, sends `ptt_start`, then base64-encodes each `ondataavailable` blob into a `ptt_chunk`. A promise chain (`chunkChain`) serializes encodes so `ptt_end` (from `recorder.onstop`) always follows the final chunk. On stop, `releaseMic()` stops the tracks — iOS otherwise keeps the mic hot (ducking/blocking incoming playback, Dynamic Island stays lit) and a cached track can silently die and record a 0 s clip. An empty recording sends `ptt_end` with no chunks; the server replies `ptt_cancel` to clear listeners' bubbles, and the transmitter sees a "Couldn't record" toast.
-- **Receive (live)** — `rxAudio` is a `Map<userId, ctx>`; on `ptt_start`, `startRx` opens a per-user `MediaSource` + `<audio autoplay>` **only for WebM the browser can decode**. Each `ptt_chunk` is `appendBuffer`'d. Simultaneous talkers each get their own context — full-duplex with zero extra coordination.
-- **Receive (fallback / iOS)** — for MP4 streams (or when `startRx` can't open one), live chunks are ignored and the committed clip **auto-plays on release** instead. A committed clip whose codec the device can't decode shows a "can't be played on this device" fallback instead of a broken player.
-- **Audio unlock + serial queue** — iOS only permits audio from a recent user gesture and blocks/queues a fresh `<audio>` each time (symptom: first clip plays, later ones don't, then all flush at once on the next gesture). So auto-play routes through **one persistent `player` element**, unlocked on the first `pointerdown`/PTT hold (`unlockAudio()` plays a silent clip on it), and a FIFO `playQueue` (`enqueuePlay`/`playNext`) plays clips one-at-a-time. The per-bubble hidden `<audio>` (driven by `setupAudioPlayer`) is still there for manual replay.
+Voice runs as **two pipelines off one mic stream** — the live stream and the durable clip have opposite container requirements (timestamped fragments vs. a seekable index), and making one MediaRecorder output serve both is what used to keep iOS out of live mode:
+
+- **Live path (worklet PCM)** — an `AudioWorklet` (`pcm-capture-worklet.js`) resamples mic audio to **mono 16 kHz Int16 PCM** and posts 60 ms frames, which go out as **binary WS frames**. Raw PCM needs no container or codec, so the same code runs on every browser — **iOS transmits and hears live audio like everything else**. ~32 KB/s upstream per talker.
+- **Archive path (MediaRecorder)** — unchanged in role: produces the compressed clip for history, seeking, and transcription. WebM uploads progressively via 250 ms timeslice; MP4 (iOS) is only valid as one complete blob (its sample index is written at the end), so it records in one piece and uploads on stop. Archive chunks are upload-only — the server no longer relays them.
+- **Transmit** — `startTransmit()` gets a **fresh** mic stream each hold, sends `ptt_start { mime, live, rate }`, starts the archive recorder, and connects mic → worklet → (muted) destination. Worklet frames are tagged `0x01` and sent as binary. A promise chain (`chunkChain`) still serializes archive-chunk encodes so `ptt_end` (from `recorder.onstop`) always follows the final chunk. On stop, `releaseMic()` tears down the worklet graph and stops the tracks — iOS otherwise keeps the mic hot (ducking/blocking incoming playback, Dynamic Island stays lit) and a cached track can silently die and record a 0 s clip. An empty recording sends `ptt_end` with no chunks; the server replies `ptt_cancel` to clear listeners' bubbles, and the transmitter sees a "Couldn't record" toast.
+- **Receive (live)** — `rxAudio` is a `Map<userId, rx>`; on a `ptt_start` with `live`, `startRx` creates a per-talker `GainNode` into the shared `AudioContext`. Each binary frame is demuxed by its uid header, converted to an `AudioBuffer`, and **scheduled back-to-back on the AudioContext clock** (`nextTime`). Simultaneous talkers each get their own node — full-duplex with zero extra coordination.
+- **Jitter buffer (smoothness ↔ snappiness)** — playback starts once `rxLead` (150 ms floor) of audio is pre-buffered. On underrun mid-stream, playback resumes just ahead of "now" and `rxLead` grows ×1.5 (capped at 500 ms); each healthy new transmission decays it ×0.9 back toward the floor. Debug counters live on `window.__lc` (`framesSent` / `framesHeard` / `underruns`).
+- **Receive (fallback)** — if the talker advertised no live stream (no AudioWorklet) or the listener lacks Web Audio, the committed clip **auto-plays on release** instead — same behavior every browser had before, now only a fallback. A committed clip whose codec the device can't decode shows a "can't be played on this device" fallback instead of a broken player.
+- **Audio unlock + serial queue** — iOS only permits audio from a recent user gesture and blocks/queues a fresh `<audio>` each time (symptom: first clip plays, later ones don't, then all flush at once on the next gesture). So auto-play routes through **one persistent `player` element**, unlocked on the first `pointerdown`/PTT hold (`unlockAudio()` plays a silent clip on it — and also creates/resumes the shared `AudioContext` while the gesture is live), and a FIFO `playQueue` (`enqueuePlay`/`playNext`) plays clips one-at-a-time. The per-bubble hidden `<audio>` (driven by `setupAudioPlayer`) is still there for manual replay.
 - **Space-to-talk** — `setupSpacePtt()` makes holding the **Space** bar push-to-talk (when not typing in a field and in a channel), routing to the same `startTransmit`/`stopTransmit`.
 - **Transcript** — server-side (see `transcribeClip` in `server.js`). After a clip commits, the server POSTs the saved file to Azure AI Speech "fast transcription"; on success it appends a `transcript` row and broadcasts `transcript`. The client's `onTranscript` patches the text into `#msg-<id> .audio-transcript` (with a brief retry in case it beats the bubble). No client speech code — works on every browser/device, in-tenant.
 - **Live indicator** — `ptt_start` renders a `draft-${userId}` "🔴 transmitting…" bubble reusing the exact draft-bubble mechanism; the committed `audio` message swaps it in-place via the existing `replaceChild` path.
-- **Cleanup** — `finishRx` lets the buffered tail play out then releases the `MediaSource`; `ptt_cancel` (transmitter left mid-clip) tears down the context and removes the bubble.
+- **Cleanup** — `finishRx` flushes any still-pre-buffering frames (clips shorter than the jitter lead), lets the scheduled tail play out, then disconnects the talker's gain node; `ptt_cancel` (transmitter left mid-clip) disconnects it immediately and removes the bubble.
 - **Playback mode setting** — the profile menu (`setupProfileMenu`) sets `playbackMode` (persisted in `localStorage`, default `'full'`):
-  - `'full'` → `startRx` opens a live stream (when the codec is decodable); commit doesn't re-play. If the codec can't stream-decode, it falls back to auto-play on commit.
+  - `'full'` → `startRx` opens a live stream (when the talker advertises one); commit doesn't re-play. A stream that never delivered a frame falls back to auto-play on commit.
   - `'onfinish'` → `startRx` returns early (no live stream); the committed clip auto-plays on release.
   - `'off'` → no live stream and no auto-play; clips are tap-to-play from history.
   Switching to a non-`'full'` mode tears down any active `rxAudio` contexts. The "🔴 transmitting…" indicator shows in all modes.
@@ -196,7 +202,10 @@ Recording support is probed once at load (`pttMime` via `MediaRecorder.isTypeSup
 function connectWS(onOpen) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws'
   ws = new WebSocket(`${proto}://${location.host}`)
-  ws.onmessage = e => handleMessage(JSON.parse(e.data))
+  ws.binaryType = 'arraybuffer'
+  ws.onmessage = e => e.data instanceof ArrayBuffer
+    ? onLiveFrame(e.data)                 // binary = live PCM frame from a talker
+    : handleMessage(JSON.parse(e.data))
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'identify', userId, name: userName }))
     if (onOpen) onOpen()
@@ -210,8 +219,7 @@ function handleMessage(msg) {
     case 'message':         // appendMessage(msg.message, { live: true })
     case 'channel_created': // add to sidebar
     case 'channel_deleted': // remove from sidebar; show "deleted" state if viewing it
-    case 'ptt_start':       // show transmitting bubble + open live playback
-    case 'ptt_chunk':       // append base64 audio to that user's MediaSource
+    case 'ptt_start':       // show transmitting bubble + open jitter-buffered live playback
     case 'ptt_cancel':      // tear down live bubble + playback (transmitter left)
     case 'transcript':      // onTranscript() — patch text into the clip bubble
     case 'message_deleted': // onMessageDeleted() — remove the bubble
@@ -266,7 +274,7 @@ Text rows have no `type` (implicitly `text`); audio rows carry `type:"audio"` + 
 - **Channel deletion is collaborative** — anyone can delete; broadcast to all clients; if you were viewing it, the room is replaced with a "That channel was deleted." message
 - **History loads once on room enter** — subsequent messages appended via WS events only
 - **Voice is full-duplex** — no floor lock; simultaneous talkers each get their own live bubble + decode context
-- **Voice degrades gracefully** — live streaming where MSE supports the codec; auto-play-on-release fallback on iOS Safari
+- **Voice degrades gracefully** — live PCM streaming wherever Web Audio exists (every modern browser, iOS included); auto-play-on-release fallback if the talker or listener can't do the live path
 - **Voice clips persist like text** — committed transmissions are `audio` rows in the same NDJSON and replay from `/media` on reload
 - **Transcripts are server-side** — the server transcribes each saved clip via Azure AI Speech and broadcasts the text; works on every device/browser, in-tenant; no-op if `AZURE_SPEECH_KEY`/`REGION` aren't set
 - **iOS auto-play is serialized** — incoming clips play through one gesture-unlocked element via a FIFO queue, so they play in order instead of being blocked then flushed all at once

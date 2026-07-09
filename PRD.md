@@ -71,7 +71,7 @@ A voice analog of the live text preview — a walkie-talkie inside each channel.
 | Behavior | Detail |
 |---|---|
 | Gesture | Press-and-hold a mic button to talk; release to stop |
-| Live while talking | Other participants hear the transmission streaming in near-real-time (~1–2s behind), not just after release |
+| Live while talking | Other participants hear the transmission streaming in near-real-time (a few hundred ms behind), not just after release |
 | Full-duplex | Anyone can transmit at any time; simultaneous talkers stack as separate live bubbles and separate clips — no floor lock or "channel busy" state |
 | Auto-playback | Incoming transmissions play automatically through the speaker — no tap-to-listen, like a real radio |
 | Live indicator | While someone holds PTT, others see a "🔴 transmitting…" bubble (reuses the live-draft bubble mechanism) |
@@ -80,7 +80,7 @@ A voice analog of the live text preview — a walkie-talkie inside each channel.
 | Playback setting | A settings menu under the profile icon picks **Voice playback** mode (persisted in `localStorage`): **Live as spoken** (default — stream while talking), **Play when finished** (auto-play the whole clip on release, no live stream), or **Off** (never auto-play; tap clips to play from history). |
 | Transcript | A text transcript shows under each clip. The **server** transcribes each saved clip via **Azure AI Speech** (in-tenant), then broadcasts the text so it appears under the bubble a moment after the clip posts — on every device, regardless of the recording browser. Disabled gracefully if the Speech resource isn't configured. |
 
-**Graceful degradation**: true live-while-talking playback uses MediaSource Extensions (Chrome/Edge/Firefox, desktop + Android). On iOS Safari (no Opus/WebM recording, unreliable MSE-for-audio), the app still works as a radio — it shows the live indicator and **auto-plays the complete clip the instant the talker releases**. iOS records in `audio/mp4` so its clips save and play everywhere.
+**Graceful degradation**: live-while-talking runs on raw PCM over Web Audio (an AudioWorklet capture pipeline separate from the saved clip), which works on every modern browser **including iOS Safari in both directions**. If either end can't do the live path (no AudioWorklet / no Web Audio), the app still works as a radio — it shows the live indicator and **auto-plays the complete clip the instant the talker releases**. iOS records its saved clips in `audio/mp4` so they save and play everywhere.
 
 | Convenience | Detail |
 |---|---|

@@ -127,6 +127,15 @@ function broadcastToAll(msg) {
   for (const ws of clients.keys()) send(ws, msg);
 }
 
+// Upper bound on a live PCM frame; anything bigger is malformed or abusive.
+const MAX_LIVE_FRAME = 32 * 1024;
+
+function broadcastBinaryToChannel(channelId, buf, excludeWs = null) {
+  for (const [ws, client] of clients) {
+    if (client.channelId === channelId && ws !== excludeWs && ws.readyState === ws.OPEN) ws.send(buf);
+  }
+}
+
 // --- REST API ---
 app.use(express.json());
 app.use(express.static(path.join(__dirname, 'public')));
@@ -186,11 +195,24 @@ app.get('/api/channels/:id/messages', (req, res) => {
 wss.on('connection', (ws) => {
   clients.set(ws, { userId: null, name: null, channelId: null });
 
-  ws.on('message', (data) => {
+  ws.on('message', (data, isBinary) => {
+    const client = clients.get(ws);
+
+    // Binary frames are live PCM audio from a talker: [0x01][Int16 PCM]. Relay to the
+    // channel with the sender's userId spliced in — never parsed, never persisted (the
+    // durable clip arrives separately as ptt_chunk uploads).
+    if (isBinary) {
+      if (!client || !client.userId || !client.channelId || !client.audioChunks) return;
+      if (data.length < 2 || data.length > MAX_LIVE_FRAME || data[0] !== 0x01) return;
+      const uid = Buffer.from(client.userId, 'utf8');
+      if (uid.length > 255) return;
+      const relay = Buffer.concat([Buffer.from([0x01, uid.length]), uid, data.subarray(1)]);
+      broadcastBinaryToChannel(client.channelId, relay, ws);
+      return;
+    }
+
     let msg;
     try { msg = JSON.parse(data); } catch { return; }
-
-    const client = clients.get(ws);
 
     switch (msg.type) {
       case 'identify': {
@@ -251,15 +273,20 @@ wss.on('connection', (ws) => {
         client.audioChunks = [];
         client.audioMime = msg.mime || 'audio/webm';
         client.audioStart = Date.now();
-        broadcastToChannel(client.channelId,
-          { type: 'ptt_start', userId: client.userId, name: client.name, mime: client.audioMime }, ws);
+        // live/rate advertise the talker's PCM stream so listeners can schedule it; a
+        // client without a live path (no AudioWorklet) omits them and listeners just
+        // wait for the committed clip.
+        broadcastToChannel(client.channelId, {
+          type: 'ptt_start', userId: client.userId, name: client.name, mime: client.audioMime,
+          live: !!msg.live, rate: Number(msg.rate) || 0
+        }, ws);
         break;
       }
       case 'ptt_chunk': {
+        // Archive upload only — accumulated for the committed clip, not relayed
+        // (listeners hear the live PCM frames instead).
         if (!client.userId || !client.channelId || !client.audioChunks || !msg.data) break;
         client.audioChunks.push(Buffer.from(msg.data, 'base64'));
-        broadcastToChannel(client.channelId,
-          { type: 'ptt_chunk', userId: client.userId, data: msg.data }, ws);
         break;
       }
       case 'ptt_end': {
