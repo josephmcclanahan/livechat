@@ -1,0 +1,97 @@
+# CI + deploy pipeline for LiveChat.
+#
+# Every push and pull request runs the `ci` job: install, syntax-check, and a
+# smoke test that boots the server and hits its HTTP endpoints.
+#
+# Pushes to `main` (and manual runs via the Actions tab) additionally run the
+# `deploy` job, which ships the app to Azure App Service. One-time setup for
+# deploys — a repository variable and a secret — is documented in DEPLOY.md
+# under "Automated deploys (GitHub Actions)".
+
+name: CI & Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  ci:
+    name: Build & smoke test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Syntax-check JavaScript
+        run: |
+          node --check server.js
+          for f in public/*.js; do node --check "$f"; done
+
+      - name: Smoke test — boot server and hit endpoints
+        run: |
+          DATA_DIR="$RUNNER_TEMP/smoke-data" PORT=3100 node server.js &
+          SERVER_PID=$!
+          for i in $(seq 1 20); do
+            curl -sf http://localhost:3100/api/channels >/dev/null && break
+            sleep 0.5
+          done
+          curl -sf http://localhost:3100/ -o /dev/null
+          curl -sf http://localhost:3100/api/channels
+          kill "$SERVER_PID"
+
+  deploy:
+    name: Deploy to Azure App Service
+    needs: ci
+    # Deploy on pushes to main and manual dispatches — never on pull requests.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    environment:
+      name: production
+      url: https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      # express + ws are pure JS, so node_modules built on the runner works
+      # as-is on App Service Linux — no Oryx build needed on the server.
+      - name: Install production dependencies
+        run: npm ci --omit=dev
+
+      - name: Assemble deployment package
+        run: |
+          mkdir -p package
+          cp -r server.js package.json package-lock.json public node_modules package/
+
+      - name: Deploy
+        uses: azure/webapps-deploy@v3
+        with:
+          app-name: ${{ vars.AZURE_WEBAPP_NAME }}
+          publish-profile: ${{ secrets.AZURE_WEBAPP_PUBLISH_PROFILE }}
+          package: package
+
+      - name: Verify deployment
+        run: |
+          for i in $(seq 1 30); do
+            curl -sf "https://${{ vars.AZURE_WEBAPP_NAME }}.azurewebsites.net/api/channels" >/dev/null && exit 0
+            sleep 5
+          done
+          echo "App did not respond after deploy" >&2
+          exit 1

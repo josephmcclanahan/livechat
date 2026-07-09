@@ -92,6 +92,54 @@ App settings (`DATA_DIR`, WebSockets) and everything under `/home/data` **persis
 
 ---
 
+## Automated deploys (GitHub Actions)
+
+The repo ships a pipeline at [`.github/workflows/ci-deploy.yml`](.github/workflows/ci-deploy.yml):
+
+- **Every push and pull request** runs a CI job: `npm ci`, a syntax check of all JavaScript, and a smoke test that boots the server and hits `/` and `/api/channels`.
+- **Pushes to `main`** (and manual runs from the Actions tab) additionally deploy to your App Service app, then verify the live site responds.
+
+CI needs no setup. Deploys need a one-time link to your Azure app — do the [first deployment](#first-deployment) above once, then:
+
+### 1. Allow publish-profile deployments
+
+The workflow authenticates with the app's *publish profile*, which requires SCM basic auth (newer App Service apps ship with it disabled):
+
+```bash
+az resource update \
+  --resource-group <your-app>_group \
+  --name scm --namespace Microsoft.Web \
+  --resource-type basicPublishingCredentialsPolicies \
+  --parent sites/<your-unique-app-name> \
+  --set properties.allow=true
+```
+
+### 2. Download the publish profile
+
+```bash
+az webapp deployment list-publishing-profiles \
+  --name <your-unique-app-name> \
+  --resource-group <your-app>_group \
+  --xml
+```
+
+Copy the full XML output.
+
+### 3. Configure the repository
+
+In GitHub → repo **Settings**:
+
+| Where | Name | Value |
+|---|---|---|
+| Secrets and variables → Actions → **Secrets** | `AZURE_WEBAPP_PUBLISH_PROFILE` | The publish-profile XML from step 2 |
+| Secrets and variables → Actions → **Variables** | `AZURE_WEBAPP_NAME` | `<your-unique-app-name>` |
+
+That's it — the next push to `main` deploys automatically. Your app settings and `/home/data` persist across automated deploys exactly as with `az webapp up`.
+
+> **Note:** the workflow uploads a ready-to-run package including `node_modules` (the dependencies are pure JavaScript), so no build runs on the server. If you prefer short-lived credentials over a publish profile, swap the deploy step for `azure/login` with an [OIDC federated credential](https://learn.microsoft.com/azure/app-service/deploy-github-actions?tabs=openid) — the rest of the workflow is unchanged.
+
+---
+
 ## Optional: voice-clip transcription (Azure AI Speech)
 
 Each voice clip can be auto-transcribed, with the text shown under the clip. This is **off** until you configure an Azure AI Speech resource — clips still post and play without it.
