@@ -108,16 +108,17 @@ body {
 
 .channel-btn.active { color: #fff; }
 
-.channel-delete-btn {
-  /* Always laid out (space reserved) so revealing it on hover doesn't resize the channel name. */
+.channel-delete-btn,
+.channel-edit-btn {
+  /* Always laid out (space reserved) so revealing them on hover doesn't resize the channel name. */
   display: flex;
   visibility: hidden;
   background: none;
   border: none;
   color: #7b8290;
   cursor: pointer;
-  padding: 0.5rem 0.625rem;
-  min-width: 44px;
+  padding: 0.5rem 0.4rem;
+  min-width: 40px;
   min-height: 44px;
   font-size: 1.1rem;
   line-height: 1;
@@ -127,14 +128,20 @@ body {
   justify-content: center;
 }
 
+.channel-edit-btn { font-size: 0.85rem; }
+
 @media (hover: hover) {
-  .channel-item:hover .channel-delete-btn { visibility: visible; }
+  .channel-item:hover .channel-delete-btn,
+  .channel-item:hover .channel-edit-btn { visibility: visible; }
   .channel-delete-btn:hover { color: #ff5555; background: rgba(255,85,85,0.1); }
+  .channel-edit-btn:hover { color: #fff; background: rgba(255,255,255,0.08); }
 }
 
 @media (hover: none) {
-  .channel-delete-btn { visibility: visible; }
+  .channel-delete-btn,
+  .channel-edit-btn { visibility: visible; }
   .channel-delete-btn:active { color: #ff5555; background: rgba(255,85,85,0.15); }
+  .channel-edit-btn:active { color: #fff; background: rgba(255,255,255,0.12); }
 }
 
 .add-channel-btn {

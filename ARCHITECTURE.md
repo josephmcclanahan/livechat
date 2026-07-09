@@ -55,6 +55,7 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 |--------|------|-------------|
 | `GET` | `/api/channels` | Return full channel list |
 | `POST` | `/api/channels` | Create channel `{ name, defaultMode }` → channel object; `defaultMode` is `'voice'` or `'chat'` (anything else → `'chat'`); broadcasts `channel_created` to all WS clients |
+| `PATCH` | `/api/channels/:id` | Edit a channel's settings; accepts either/both of `{ name, defaultMode }` (omitted fields unchanged, blank name → 400); broadcasts `channel_updated` to all WS clients |
 | `DELETE` | `/api/channels/:id` | Remove channel from list, delete its NDJSON file, broadcast `channel_deleted` to all WS clients |
 | `GET` | `/api/channels/:id/messages` | Return last 200 messages from NDJSON file |
 
@@ -81,6 +82,7 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | `draft_update` | `{ userId, name, text }` | On every `draft`; `text: ""` signals removal |
 | `message` | `{ message: { id, userId, name, text, timestamp } }` or `{ message: { id, type:'audio', userId, name, url, mime, duration, timestamp } }` | When a text message is sent or a voice clip is committed |
 | `channel_created` | `{ channel: { id, name, defaultMode, createdAt } }` | When any client creates a channel |
+| `channel_updated` | `{ channel: { id, name, defaultMode, createdAt } }` | When any client edits a channel's settings |
 | `channel_deleted` | `{ channelId }` | When any client deletes a channel |
 | `ptt_start` | `{ userId, name, mime }` | Another user began transmitting — show live bubble + prep playback |
 | `ptt_chunk` | `{ userId, data }` | Live base64 audio chunk relayed from a transmitter |
@@ -134,7 +136,8 @@ let lastMsgTs        // timestamp of the last rendered message (for time separat
 - Main area starts in `.welcome-state` (prompt to pick a channel)
 - Fetches `/api/channels` once and populates the sidebar
 - Sidebar opens/closes via hamburger on narrow screens
-- `+ Add Channel` button → a modal dialog collects the channel's settings (name + default mode: chat first / voice first) → `POST /api/channels` → opens new channel immediately (the creator adds the channel from the POST response; `onChannelCreated` dedupes against the WS broadcast)
+- `+ Add Channel` button → a modal dialog (`openChannelModal()`) collects the channel's settings (name + default mode: chat first / voice first) → `POST /api/channels` → opens new channel immediately (the creator adds the channel from the POST response; `onChannelCreated` dedupes against the WS broadcast)
+- Each channel row also has a `✎` edit button → the same dialog pre-filled (`openChannelModal(channel)`) → `PATCH /api/channels/:id`. `onChannelUpdated` (PATCH response + `channel_updated` broadcast, idempotent) mutates the cached channel object **in place** so the sidebar's closures stay fresh, relabels the sidebar row, and — if you're in that room — updates the title, re-seeds the layout when the default mode changed, and re-renders the composer (preserving any in-progress draft)
 - Each channel row has a `×` delete button → `DELETE /api/channels/:id` (with `confirm()`)
 
 **`openRoom(channelId, channelName)`**

@@ -149,6 +149,24 @@ app.post('/api/channels', (req, res) => {
   res.json(channel);
 });
 
+// Edit a channel's settings after creation. Accepts either or both of { name, defaultMode };
+// omitted fields keep their current value.
+app.patch('/api/channels/:id', (req, res) => {
+  const channel = channels.find(c => c.id === req.params.id);
+  if (!channel) return res.status(404).json({ error: 'Not found' });
+  if (req.body.name !== undefined) {
+    const name = String(req.body.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    channel.name = name;
+  }
+  if (req.body.defaultMode !== undefined) {
+    channel.defaultMode = req.body.defaultMode === 'voice' ? 'voice' : 'chat';
+  }
+  saveChannels();
+  broadcastToAll({ type: 'channel_updated', channel });
+  res.json(channel);
+});
+
 app.delete('/api/channels/:id', (req, res) => {
   const idx = channels.findIndex(c => c.id === req.params.id);
   if (idx === -1) return res.status(404).json({ error: 'Not found' });

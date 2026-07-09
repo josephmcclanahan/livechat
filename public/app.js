@@ -40,6 +40,7 @@ function handleMessage(msg) {
     case 'draft_update': updateDraft(msg); break;
     case 'message':      appendMessage(msg.message, { live: true }); break;
     case 'channel_created': onChannelCreated(msg.channel); break;
+    case 'channel_updated': onChannelUpdated(msg.channel); break;
     case 'channel_deleted': onChannelDeleted(msg.channelId); break;
     case 'ptt_start':    onPttStart(msg); break;
     case 'ptt_chunk':    pushRx(msg.userId, msg.data); break;
@@ -134,7 +135,7 @@ function renderLayout() {
     document.getElementById('sidebar').classList.remove('open');
   });
 
-  document.getElementById('new-channel-btn').addEventListener('click', createChannel);
+  document.getElementById('new-channel-btn').addEventListener('click', () => openChannelModal());
 
   setupProfileMenu();
 }
@@ -195,6 +196,15 @@ function addChannelToSidebar(channel) {
     openRoom(channel.id, channel.name);
   });
 
+  const edit = document.createElement('button');
+  edit.className = 'channel-edit-btn';
+  edit.title = 'Channel settings';
+  edit.textContent = '✎';
+  edit.addEventListener('click', (e) => {
+    e.stopPropagation();
+    openChannelModal(channel);
+  });
+
   const del = document.createElement('button');
   del.className = 'channel-delete-btn';
   del.title = 'Delete channel';
@@ -206,6 +216,7 @@ function addChannelToSidebar(channel) {
   });
 
   li.appendChild(btn);
+  li.appendChild(edit);
   li.appendChild(del);
   list.appendChild(li);
 }
@@ -216,16 +227,16 @@ function setActiveChannel(channelId) {
   if (li) li.querySelector('.channel-btn').classList.add('active');
 }
 
-// New-channel dialog: asks for the channel's settings — name and default mode (voice first
-// or chat first) — before creating it.
-function createChannel() {
+// Channel settings dialog — name and default mode (voice first or chat first). With no
+// argument it creates a new channel; given an existing channel it edits it in place.
+function openChannelModal(channel = null) {
   document.getElementById('channel-modal')?.remove();
   const overlay = document.createElement('div');
   overlay.className = 'modal-overlay';
   overlay.id = 'channel-modal';
   overlay.innerHTML = `
     <form class="modal" id="channel-form">
-      <h2>New channel</h2>
+      <h2>${channel ? 'Channel settings' : 'New channel'}</h2>
       <label class="modal-label" for="channel-name-input">Name</label>
       <input id="channel-name-input" type="text" maxlength="32" placeholder="e.g. general" autocomplete="off" />
       <span class="modal-label">Default mode</span>
@@ -247,7 +258,7 @@ function createChannel() {
       </div>
       <div class="modal-actions">
         <button type="button" class="modal-cancel" id="channel-cancel">Cancel</button>
-        <button type="submit">Create</button>
+        <button type="submit">${channel ? 'Save' : 'Create'}</button>
       </div>
     </form>
   `;
@@ -255,6 +266,11 @@ function createChannel() {
 
   const form = overlay.querySelector('#channel-form');
   const nameInput = overlay.querySelector('#channel-name-input');
+  if (channel) {
+    nameInput.value = channel.name;
+    const mode = form.querySelector(`input[name="default-mode"][value="${(channel.defaultMode || 'chat') === 'voice' ? 'voice' : 'chat'}"]`);
+    if (mode) mode.checked = true;
+  }
   nameInput.focus();
 
   const close = () => overlay.remove();
@@ -267,17 +283,21 @@ function createChannel() {
     const name = nameInput.value.trim();
     if (!name) { nameInput.focus(); return; }
     const defaultMode = form.querySelector('input[name="default-mode"]:checked').value;
-    fetch('/api/channels', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ name, defaultMode })
-    })
+    const req = channel
+      ? fetch(`/api/channels/${channel.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, defaultMode }) })
+      : fetch('/api/channels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, defaultMode }) });
+    req
       .then(r => r.json())
-      .then(channel => {
+      .then(saved => {
         close();
-        onChannelCreated(channel); // don't wait on the WS broadcast — openRoom needs the settings
-        document.getElementById('sidebar').classList.remove('open');
-        openRoom(channel.id, channel.name);
+        // Apply from the response rather than waiting on the WS broadcast.
+        if (channel) {
+          onChannelUpdated(saved);
+        } else {
+          onChannelCreated(saved);
+          document.getElementById('sidebar').classList.remove('open');
+          openRoom(saved.id, saved.name);
+        }
       });
   });
 }
@@ -286,6 +306,31 @@ function onChannelCreated(channel) {
   // The creator hears about the channel twice (POST response + WS broadcast) — add it once.
   if (!channels.find(c => c.id === channel.id)) channels.push(channel);
   addChannelToSidebar(channel);
+}
+
+function onChannelUpdated(channel) {
+  const cached = channels.find(c => c.id === channel.id);
+  const prevMode = cached?.defaultMode || 'chat';
+  // Mutate the cached object in place — the sidebar's click/edit/delete handlers hold a
+  // reference to it, so they pick up the new settings without re-wiring.
+  if (cached) Object.assign(cached, channel);
+  else channels.push(channel);
+
+  const btn = document.querySelector(`#ch-${channel.id} .channel-btn`);
+  if (btn) btn.textContent = `# ${channel.name}`;
+
+  if (currentChannelId === channel.id) {
+    currentChannelName = channel.name;
+    document.getElementById('room-title').textContent = `# ${channel.name}`;
+    // Re-seed the layout only when the default mode actually changed, so an unrelated rename
+    // doesn't clobber someone's live voice-first override.
+    if ((channel.defaultMode || 'chat') !== prevMode) {
+      voiceFirst = (channel.defaultMode || 'chat') === 'voice';
+      const vf = document.getElementById('voice-first-toggle');
+      if (vf) vf.checked = voiceFirst;
+    }
+    renderComposer(); // refresh the "Message #name" placeholder (and layout if mode changed)
+  }
 }
 
 function onChannelDeleted(channelId) {
@@ -382,12 +427,16 @@ function wireComposer() {
   }
 }
 
-// Re-render just the composer in place (e.g. when the voice-first setting is toggled mid-channel).
+// Re-render just the composer in place (voice-first toggled mid-channel, or the channel's
+// settings were edited). Carries any in-progress draft across the swap.
 function renderComposer() {
   const form = document.getElementById('msg-form');
   if (!form || !currentChannelName) return;
+  const draft = document.getElementById('msg-input')?.value || '';
   form.outerHTML = composerMarkup(currentChannelName);
   wireComposer();
+  const input = document.getElementById('msg-input');
+  if (input && draft) input.value = draft;
 }
 
 // iMessage-style time separator. Returns { day, time } — e.g. { day:'Today', time:'12:30 PM' },

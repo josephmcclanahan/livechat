@@ -38,6 +38,7 @@ A lightweight, auth-less prototype chat application with a key differentiating f
 - On mobile (<600px) the sidebar collapses behind a hamburger and overlays the screen when opened
 - Creating a channel: tap `+ Add Channel` — a dialog asks for the channel's settings (name + default mode), and the new channel opens immediately
 - Channel settings: **name** and **default mode** — **Chat first** (message box up front, inline mic) or **Voice first** (big centered push-to-talk button). The mode picks which composer layout the channel opens in for everyone
+- Editing a channel: tap the `✎` next to a channel name — the same settings dialog opens pre-filled; saving updates the name and default mode for everyone live (sidebar, room title, and composer layout if the mode changed)
 - Deleting a channel: tap the `×` next to a channel name and confirm — broadcasts deletion to all clients
 
 ### 3. Chat Room (in main area)
@@ -84,7 +85,7 @@ A voice analog of the live text preview — a walkie-talkie inside each channel.
 | Convenience | Detail |
 |---|---|
 | Space shortcut | Holding the **Space** bar (when not typing in a field) acts as push-to-talk, like holding the mic button. |
-| Voice-first layout | Each channel has a **default mode** setting (chosen at creation): **voice first** opens the channel with a big centered record button above the message box — walkie-talkie over the thread; **chat first** opens keyboard-forward. A **profile → settings** toggle overrides the layout live for the room you're in. |
+| Voice-first layout | Each channel has a **default mode** setting (chosen at creation, editable via the sidebar `✎`): **voice first** opens the channel with a big centered record button above the message box — walkie-talkie over the thread; **chat first** opens keyboard-forward. A **profile → settings** toggle overrides the layout live for the room you're in. |
 | Custom player | Voice clips render with a minimal play/pause + seekable progress bar (no volume control — system volume governs); transcript sits inside the same bubble. |
 
 ---
