@@ -587,9 +587,11 @@ body {
   50%      { transform: scaleY(1); }
 }
 
-/* --- Modal (new-channel settings dialog) --- */
+/* --- Modal (channel settings dialog) --- */
 .modal-overlay {
-  position: fixed;
+  /* Absolute within #app (position: fixed, sized to the visual viewport by setupViewport), so
+     the dialog centers in the VISIBLE area — above the mobile keyboard, not underneath it. */
+  position: absolute;
   inset: 0;
   z-index: 300;
   background: rgba(0, 0, 0, 0.4);
@@ -597,6 +599,7 @@ body {
   align-items: center;
   justify-content: center;
   padding: 1rem;
+  overflow-y: auto; /* dialog taller than the keyboard-shrunk viewport → scroll, don't clip */
 }
 
 .modal {
@@ -661,7 +664,7 @@ body {
   opacity: 0;
   pointer-events: none;
   transition: opacity 0.2s ease, transform 0.2s ease;
-  z-index: 200;
+  z-index: 400; /* above the modal overlay — save errors surface while the dialog is open */
 }
 .toast.show { opacity: 1; transform: translateX(-50%) translateY(0); }
 
@@ -687,6 +690,9 @@ button {
   cursor: pointer;
   font-size: 0.95rem;
   white-space: nowrap;
+  /* Never let taps/double-clicks select button label text (iOS shows a caret/selection in it). */
+  user-select: none;
+  -webkit-user-select: none;
 }
 
 @media (hover: hover) {

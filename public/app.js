@@ -262,7 +262,11 @@ function openChannelModal(channel = null) {
       </div>
     </form>
   `;
-  document.body.appendChild(overlay);
+  // Mount inside #app, which is kept sized to the visual viewport: when the mobile keyboard
+  // opens, the dialog re-centers in the visible area instead of staying centered in the full
+  // layout viewport with its Save/Cancel row hidden under the keyboard (and iOS rendering the
+  // input's caret detached, floating over other content).
+  document.getElementById('app').appendChild(overlay);
 
   const form = overlay.querySelector('#channel-form');
   const nameInput = overlay.querySelector('#channel-name-input');
@@ -270,8 +274,11 @@ function openChannelModal(channel = null) {
     nameInput.value = channel.name;
     const mode = form.querySelector(`input[name="default-mode"][value="${(channel.defaultMode || 'chat') === 'voice' ? 'voice' : 'chat'}"]`);
     if (mode) mode.checked = true;
+  } else {
+    // Only the create path starts in the name field (it's empty and required). On edit the
+    // name is already filled — focusing it would just pop the keyboard over the dialog.
+    nameInput.focus();
   }
-  nameInput.focus();
 
   const close = () => overlay.remove();
   overlay.querySelector('#channel-cancel').addEventListener('click', close);
@@ -287,7 +294,11 @@ function openChannelModal(channel = null) {
       ? fetch(`/api/channels/${channel.id}`, { method: 'PATCH', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, defaultMode }) })
       : fetch('/api/channels', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ name, defaultMode }) });
     req
-      .then(r => r.json())
+      .then(async (r) => {
+        const body = await r.json().catch(() => null);
+        if (!r.ok || !body || body.error) throw new Error(body?.error || `Save failed (HTTP ${r.status})`);
+        return body;
+      })
       .then(saved => {
         close();
         // Apply from the response rather than waiting on the WS broadcast.
@@ -298,7 +309,9 @@ function openChannelModal(channel = null) {
           document.getElementById('sidebar').classList.remove('open');
           openRoom(saved.id, saved.name);
         }
-      });
+      })
+      // Keep the dialog open so nothing is lost; surface why instead of silently doing nothing.
+      .catch(err => showToast(err.message || 'Couldn’t save channel'));
   });
 }
 
@@ -617,6 +630,7 @@ function setupSpacePtt() {
   document.addEventListener('keydown', (e) => {
     if (e.code !== 'Space' || e.repeat || spaceHeld) return;
     if (isTypingTarget(document.activeElement) || !currentChannelId || !pttMime) return;
+    if (document.getElementById('channel-modal')) return; // dialog open — Space activates buttons
     e.preventDefault(); // stop page scroll + button activation
     spaceHeld = true;
     startTransmit();
