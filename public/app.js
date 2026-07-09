@@ -807,27 +807,15 @@ function ensureWorklet() {
   return workletReady;
 }
 
-const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
-  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-
-// iOS re-configures the hardware sample rate when the mic session starts (48 kHz → 24 kHz
-// on some routes), but an AudioContext's rate is locked at creation and WebKit feeds mic
-// samples into a stale-rate context unresampled — captured audio then plays at the wrong
-// speed. Once the mic is live, rebuild the shared context if its rate doesn't match the
-// session (or can't be verified). iOS-only: on other platforms a track-vs-context rate
-// difference is normal and correctly resampled, and rebuilding would churn every hold.
-function syncCtxToMicSession() {
-  const ctx = getAudioCtx();
-  if (!ctx || !micStream) return;
-  const track = micStream.getAudioTracks()[0];
-  const trackRate = track && track.getSettings ? track.getSettings().sampleRate : undefined;
-  if (trackRate && trackRate === ctx.sampleRate) return;
-  for (const uid of [...rxAudio.keys()]) teardownRx(uid);
-  try { ctx.close(); } catch {}
-  audioCtx = null;
-  workletReady = null;
-  getAudioCtx(); // adopts the live session's rate; keeper's media session lets it start
-}
+// The worklet's resample step assumes mic samples arrive at the context's rate. That
+// assumption breaks on iOS: the hardware rate changes when the mic session starts (e.g.
+// 48 kHz → 24 kHz on some routes) while the context's rate stays locked at creation, so
+// captured audio comes out at the wrong speed. Rather than model WebKit's session
+// behavior (rebuilding the context mid-hold corrupts MediaRecorder's clip), the capture
+// path SELF-CALIBRATES: measure emitted-audio-seconds against the wall clock early in
+// each hold and scale the worklet's step by the observed ratio. The learned scale
+// persists across holds, so only the first hold on a mismatched route drifts briefly.
+let txStepScale = 1;
 
 // iOS mutes Web Audio's output with the ring/silent switch UNLESS the page's audio
 // session is in playback mode — which any playing media element provides (observed
@@ -937,7 +925,6 @@ async function startTransmit() {
   }
   if (!transmitting) { releaseMic(); return; } // released before permission resolved
 
-  if (IS_IOS) syncCtxToMicSession();
   const liveOk = await ensureWorklet(); // instant when the module is already loaded
   if (!transmitting) { releaseMic(); return; }
 
@@ -979,8 +966,28 @@ function startLiveTx() {
     const node = new AudioWorkletNode(ctx, 'pcm-capture', {
       processorOptions: { targetRate: LIVE_RATE, frameSize: LIVE_FRAME }
     });
+    if (txStepScale !== 1) node.port.postMessage({ type: 'stepScale', value: txStepScale });
+    let firstFrameAt = 0, holdFrames = 0, calibrated = false;
     node.port.onmessage = (e) => {
       const pcm = e.data; // Int16Array
+
+      // Self-calibration: after ~0.6s, compare audio-seconds emitted to wall time. A
+      // healthy pipeline reads ~1.0; a stale-rate mic feed reads ~0.5 or ~2. Correct the
+      // worklet's step once per hold and remember the scale for the next one.
+      holdFrames++;
+      const now = performance.now();
+      if (holdFrames === 1) firstFrameAt = now;
+      else if (!calibrated && now - firstFrameAt > 600) {
+        calibrated = true;
+        const ratio = ((holdFrames - 1) * LIVE_FRAME / LIVE_RATE * 1000) / (now - firstFrameAt);
+        __lc.txRatio = ratio;
+        if (ratio < 0.85 || ratio > 1.18) {
+          txStepScale = Math.min(2.5, Math.max(0.4, txStepScale * ratio));
+          node.port.postMessage({ type: 'stepScale', value: txStepScale });
+          __lc.txStepScale = txStepScale;
+        }
+      }
+
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
       const out = new Uint8Array(1 + pcm.byteLength);
       out[0] = 0x01;

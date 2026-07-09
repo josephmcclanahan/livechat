@@ -9,7 +9,16 @@ class PcmCaptureProcessor extends AudioWorkletProcessor {
     const opts = (options && options.processorOptions) || {};
     this.targetRate = opts.targetRate || 16000;
     this.frameSize = opts.frameSize || 960;
-    this.step = sampleRate / this.targetRate; // input samples per output sample
+    this.baseStep = sampleRate / this.targetRate; // input samples per output sample
+    this.step = this.baseStep;
+    // Main thread measures real throughput and corrects the step — the context's global
+    // sampleRate can misstate the mic feed's true rate (iOS changes the hardware rate
+    // when the mic session starts, after this context's rate was locked).
+    this.port.onmessage = (e) => {
+      if (e.data && e.data.type === 'stepScale' && e.data.value > 0) {
+        this.step = this.baseStep * e.data.value;
+      }
+    };
     this.raw = new Float32Array(8192);        // unconsumed input samples
     this.rawLen = 0;
     this.readPos = 0;                         // fractional resample cursor into `raw`
