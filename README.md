@@ -52,6 +52,8 @@ Full design details are in [ARCHITECTURE.md](ARCHITECTURE.md).
 
 Designed for one-command deploy to **Azure App Service** using the persistent `/home` mount (no storage account needed). Step-by-step guide in [DEPLOY.md](DEPLOY.md).
 
+A GitHub Actions pipeline ([`.github/workflows/ci-deploy.yml`](.github/workflows/ci-deploy.yml)) runs CI (syntax check + server smoke test) on every push and PR, and auto-deploys `main` to App Service once you've added the publish-profile secret — setup steps in [DEPLOY.md](DEPLOY.md#automated-deploys-github-actions).
+
 ## Project structure
 
 ```
