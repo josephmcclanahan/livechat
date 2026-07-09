@@ -139,10 +139,31 @@ app.get('/api/channels', (req, res) => {
 app.post('/api/channels', (req, res) => {
   const name = (req.body.name || '').trim();
   if (!name) return res.status(400).json({ error: 'Name required' });
-  const channel = { id: crypto.randomUUID().slice(0, 8), name, createdAt: new Date().toISOString() };
+  // Channel setting: which composer layout the channel opens in — 'voice' (big push-to-talk
+  // button) or 'chat' (keyboard-forward). Anything unexpected falls back to 'chat'.
+  const defaultMode = req.body.defaultMode === 'voice' ? 'voice' : 'chat';
+  const channel = { id: crypto.randomUUID().slice(0, 8), name, defaultMode, createdAt: new Date().toISOString() };
   channels.push(channel);
   saveChannels();
   broadcastToAll({ type: 'channel_created', channel });
+  res.json(channel);
+});
+
+// Edit a channel's settings after creation. Accepts either or both of { name, defaultMode };
+// omitted fields keep their current value.
+app.patch('/api/channels/:id', (req, res) => {
+  const channel = channels.find(c => c.id === req.params.id);
+  if (!channel) return res.status(404).json({ error: 'Not found' });
+  if (req.body.name !== undefined) {
+    const name = String(req.body.name || '').trim();
+    if (!name) return res.status(400).json({ error: 'Name required' });
+    channel.name = name;
+  }
+  if (req.body.defaultMode !== undefined) {
+    channel.defaultMode = req.body.defaultMode === 'voice' ? 'voice' : 'chat';
+  }
+  saveChannels();
+  broadcastToAll({ type: 'channel_updated', channel });
   res.json(channel);
 });
 

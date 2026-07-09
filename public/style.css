@@ -108,16 +108,17 @@ body {
 
 .channel-btn.active { color: #fff; }
 
-.channel-delete-btn {
-  /* Always laid out (space reserved) so revealing it on hover doesn't resize the channel name. */
+.channel-delete-btn,
+.channel-edit-btn {
+  /* Always laid out (space reserved) so revealing them on hover doesn't resize the channel name. */
   display: flex;
   visibility: hidden;
   background: none;
   border: none;
   color: #7b8290;
   cursor: pointer;
-  padding: 0.5rem 0.625rem;
-  min-width: 44px;
+  padding: 0.5rem 0.4rem;
+  min-width: 40px;
   min-height: 44px;
   font-size: 1.1rem;
   line-height: 1;
@@ -127,14 +128,20 @@ body {
   justify-content: center;
 }
 
+.channel-edit-btn { font-size: 0.85rem; }
+
 @media (hover: hover) {
-  .channel-item:hover .channel-delete-btn { visibility: visible; }
+  .channel-item:hover .channel-delete-btn,
+  .channel-item:hover .channel-edit-btn { visibility: visible; }
   .channel-delete-btn:hover { color: #ff5555; background: rgba(255,85,85,0.1); }
+  .channel-edit-btn:hover { color: #fff; background: rgba(255,255,255,0.08); }
 }
 
 @media (hover: none) {
-  .channel-delete-btn { visibility: visible; }
+  .channel-delete-btn,
+  .channel-edit-btn { visibility: visible; }
   .channel-delete-btn:active { color: #ff5555; background: rgba(255,85,85,0.15); }
+  .channel-edit-btn:active { color: #fff; background: rgba(255,255,255,0.12); }
 }
 
 .add-channel-btn {
@@ -579,6 +586,66 @@ body {
   0%, 100% { transform: scaleY(0.4); }
   50%      { transform: scaleY(1); }
 }
+
+/* --- Modal (new-channel settings dialog) --- */
+.modal-overlay {
+  position: fixed;
+  inset: 0;
+  z-index: 300;
+  background: rgba(0, 0, 0, 0.4);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 1rem;
+}
+
+.modal {
+  width: 100%;
+  max-width: 22rem;
+  background: #fff;
+  border-radius: 12px;
+  box-shadow: 0 12px 40px rgba(0, 0, 0, 0.25);
+  padding: 1.25rem;
+  display: flex;
+  flex-direction: column;
+  gap: 0.6rem;
+}
+
+.modal h2 { font-size: 1.05rem; }
+
+.modal-label {
+  font-size: 0.78rem;
+  font-weight: 600;
+  color: #555;
+  margin-top: 0.25rem;
+}
+
+.mode-options { display: flex; flex-direction: column; gap: 0.4rem; }
+
+.mode-option {
+  display: flex;
+  align-items: flex-start;
+  gap: 0.55rem;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 0.55rem 0.65rem;
+  cursor: pointer;
+}
+.mode-option:has(input:checked) { border-color: #0066ff; background: #f0f5ff; }
+.mode-option input { margin-top: 0.2rem; accent-color: #0066ff; cursor: pointer; }
+
+.mode-option-body { display: flex; flex-direction: column; gap: 0.1rem; }
+.mode-option-body strong { font-size: 0.9rem; font-weight: 600; color: #111; }
+.mode-option-body small { font-size: 0.75rem; color: #777; }
+
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 0.5rem;
+  margin-top: 0.35rem;
+}
+.modal-cancel { background: #eef1f5; color: #333; }
+@media (hover: hover) { .modal-cancel:hover { background: #e2e6ec; } }
 
 /* --- Toast --- */
 .toast {
