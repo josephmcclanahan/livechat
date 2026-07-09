@@ -23,11 +23,15 @@ if (!userId) {
 function connectWS(onOpen) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
   ws = new WebSocket(`${proto}://${location.host}`);
+  ws.binaryType = 'arraybuffer'; // binary frames carry live PCM audio; JSON carries everything else
   ws.onopen = () => {
     ws.send(JSON.stringify({ type: 'identify', userId, name: userName }));
     if (onOpen) onOpen();
   };
-  ws.onmessage = (e) => handleMessage(JSON.parse(e.data));
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) onLiveFrame(e.data);
+    else handleMessage(JSON.parse(e.data));
+  };
   ws.onclose = () => setTimeout(() => connectWS(), 2000);
 }
 
@@ -43,7 +47,6 @@ function handleMessage(msg) {
     case 'channel_updated': onChannelUpdated(msg.channel); break;
     case 'channel_deleted': onChannelDeleted(msg.channelId); break;
     case 'ptt_start':    onPttStart(msg); break;
-    case 'ptt_chunk':    pushRx(msg.userId, msg.data); break;
     case 'ptt_cancel':   cancelTransmit(msg.userId); break;
     case 'transcript':   onTranscript(msg); break;
     case 'message_deleted': onMessageDeleted(msg.id); break;
@@ -508,8 +511,10 @@ function appendMessage(msg, { scroll = true, live = false } = {}) {
 
   let shouldAutoplay = false;
   if (msg.type === 'audio') {
-    // Auto-play on commit unless playback is off, it's our own clip, or we already heard it live.
-    const playedLive = live && rxAudio.has(msg.userId);
+    // Auto-play on commit unless playback is off, it's our own clip, or we already heard it
+    // live. An open rx that never received a frame (sender's live path failed) doesn't count.
+    const rx = rxAudio.get(msg.userId);
+    const playedLive = live && !!rx && (rx.started || rx.pending.length > 0);
     shouldAutoplay = playbackMode !== 'off' && live && !isMine && !playedLive;
     const dur = msg.duration ? `${msg.duration.toFixed(1)}s` : '';
     // Empty placeholder (hidden via :empty) that the async `transcript` event fills in.
@@ -751,8 +756,15 @@ function escHtml(str) {
 }
 
 // --- Push-to-talk voice ---
-// Recording support (drives whether the PTT button shows). Live playback is decided
-// per-incoming-stream via MediaSource.isTypeSupported(senderMime).
+// Two pipelines run off the same mic stream:
+//   • Live path — an AudioWorklet posts raw Int16 PCM frames (mono, LIVE_RATE Hz) that are
+//     relayed as binary WS frames and scheduled straight into listeners' AudioContext.
+//     No containers, no MSE, no codec negotiation — works identically on every browser,
+//     including iOS in BOTH directions.
+//   • Archive path — MediaRecorder produces the durable compressed clip for history,
+//     seeking, and transcription. Its chunks upload to the server but are never relayed.
+// Recording support (drives whether the PTT button shows) still keys off MediaRecorder,
+// since a hold that can't produce a committed clip shouldn't happen at all.
 let pttMime = '';
 (function probePtt() {
   if (typeof MediaRecorder === 'undefined') return;
@@ -762,12 +774,43 @@ let pttMime = '';
 // Transcription is server-side (Azure AI Speech) — see server.js. Clips arrive with a transcript
 // shortly after they commit, via the `transcript` WS message handled in onTranscript().
 
+const LIVE_RATE = 16000; // Hz — phone-call quality; ~32 KB/s upstream per talker
+const LIVE_FRAME = 960;  // samples per binary frame (60 ms at 16 kHz)
+
+// Live-path debug counters — inspect `__lc` from the console on a misbehaving device.
+const __lc = { framesSent: 0, framesHeard: 0, underruns: 0 };
+window.__lc = __lc;
+
+// One shared AudioContext drives both live capture (worklet) and live playback (scheduled
+// buffers). iOS creates it 'suspended' until a user gesture resumes it — unlockAudio()
+// takes care of that on the first touch.
+let audioCtx = null;
+let workletReady = null;
+
+function getAudioCtx() {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) return null;
+  if (!audioCtx) audioCtx = new AC();
+  if (audioCtx.state === 'suspended') audioCtx.resume().catch(() => {});
+  return audioCtx;
+}
+
+function ensureWorklet() {
+  const ctx = getAudioCtx();
+  if (!ctx || !ctx.audioWorklet) return Promise.resolve(false);
+  if (!workletReady) {
+    workletReady = ctx.audioWorklet.addModule('pcm-capture-worklet.js').then(() => true, () => false);
+  }
+  return workletReady;
+}
+
 let micStream = null;
 let recorder = null;
+let liveTx = null; // { src, node, mute } — active worklet capture graph
 let transmitting = false;
 let txHadData = false; // did the current transmission actually capture any audio?
 let chunkChain = Promise.resolve();
-const rxAudio = new Map(); // userId → { ms, audio, sb, queue, open }
+const rxAudio = new Map(); // userId → { gain, rate, nextTime, started, pending }
 
 // --- Auto-play of incoming clips ---
 // iOS only permits audio that originates from a user gesture, and blocks/queues a fresh <audio>
@@ -782,6 +825,7 @@ let playing = false;
 const SILENT_CLIP = 'data:audio/mp4;base64,AAAAHGZ0eXBNNEEgAAAAAE00QSBpc29tbXA0MgAAAAhmcmVlAAAAGm1kYXQAAAAA';
 let audioUnlocked = false;
 function unlockAudio() {
+  getAudioCtx(); // create/resume the AudioContext while we hold a user gesture
   if (audioUnlocked) return;
   audioUnlocked = true;
   try {
@@ -832,9 +876,12 @@ async function startTransmit() {
     showToast('Microphone access denied');
     return;
   }
-  if (!transmitting) return; // released before permission resolved
+  if (!transmitting) { releaseMic(); return; } // released before permission resolved
 
-  wsSend({ type: 'ptt_start', mime: pttMime });
+  const liveOk = await ensureWorklet(); // instant after the first hold
+  if (!transmitting) { releaseMic(); return; }
+
+  wsSend({ type: 'ptt_start', mime: pttMime, live: liveOk, rate: LIVE_RATE });
   txHadData = false;
   recorder = new MediaRecorder(micStream, { mimeType: pttMime });
   recorder.ondataavailable = (e) => {
@@ -851,11 +898,54 @@ async function startTransmit() {
     releaseMic(); // fires after the final ondataavailable, so no audio is truncated
     if (!txHadData) showToast('Couldn’t record — try again'); // mic never produced audio
   };
-  // Only WebM concatenates into a valid file from timeslice fragments (and streams via MSE).
-  // MP4 (iOS) must be recorded in one piece, or the assembled file's index is corrupt — so no
-  // timeslice: a single complete, valid blob is emitted on stop (plays on release, no live stream).
+  // Archive recorder only — live audio rides the worklet PCM path, not these chunks.
+  // WebM uploads progressively via timeslice so long holds don't burst on release; MP4 (iOS)
+  // is only valid as one complete blob (its sample index is written at the end), so it
+  // records in one piece and uploads on stop.
   if (pttMime.includes('webm')) recorder.start(250);
   else recorder.start();
+
+  if (liveOk) startLiveTx();
+}
+
+// Mic → worklet (resample to LIVE_RATE Int16 frames) → binary WS frames. The worklet's
+// output is muted into the destination only to keep the graph pulled — nothing is audible
+// locally.
+function startLiveTx() {
+  const ctx = getAudioCtx();
+  if (!ctx || !micStream) return;
+  try {
+    const src = ctx.createMediaStreamSource(micStream);
+    const node = new AudioWorkletNode(ctx, 'pcm-capture', {
+      processorOptions: { targetRate: LIVE_RATE, frameSize: LIVE_FRAME }
+    });
+    node.port.onmessage = (e) => {
+      const pcm = e.data; // Int16Array
+      if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      const out = new Uint8Array(1 + pcm.byteLength);
+      out[0] = 0x01;
+      out.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), 1);
+      ws.send(out);
+      __lc.framesSent++;
+    };
+    const mute = ctx.createGain();
+    mute.gain.value = 0;
+    src.connect(node);
+    node.connect(mute);
+    mute.connect(ctx.destination);
+    liveTx = { src, node, mute };
+  } catch {
+    liveTx = null; // listeners fall back to hearing the committed clip
+  }
+}
+
+function stopLiveTx() {
+  if (!liveTx) return;
+  try { liveTx.node.port.onmessage = null; } catch {}
+  try { liveTx.src.disconnect(); } catch {}
+  try { liveTx.node.disconnect(); } catch {}
+  try { liveTx.mute.disconnect(); } catch {}
+  liveTx = null;
 }
 
 function stopTransmit() {
@@ -875,6 +965,7 @@ function stopTransmit() {
 // which ducks/blocks incoming clip playback and turns off the recording indicator) and so the next
 // transmission gets a FRESH stream — a cached iOS track can silently die and record a 0s clip.
 function releaseMic() {
+  stopLiveTx();
   if (!micStream) return;
   micStream.getTracks().forEach(t => t.stop());
   micStream = null;
@@ -892,7 +983,7 @@ function blobToBase64(blob) {
 function onPttStart(msg) {
   if (msg.userId === userId) return;
   showTransmitBubble(msg.userId, msg.name);
-  startRx(msg.userId, msg.mime);
+  if (msg.live && msg.rate) startRx(msg.userId, msg.rate);
 }
 
 function showTransmitBubble(uid, name) {
@@ -912,54 +1003,79 @@ function showTransmitBubble(uid, name) {
   scrollHistory();
 }
 
-function startRx(uid, mime) {
-  // Live streaming only in 'full' mode, only for WebM (MP4 fragments from MediaRecorder don't
-  // append cleanly to a SourceBuffer → chopped/skipping), and only if this browser can decode it.
-  // Anything else falls back to playing the committed clip on release.
+// Jitter buffer: hold this much audio before starting playback. Adaptive — grows when the
+// network stalls mid-stream (smoothness), decays a little on each healthy new transmission
+// so latency creeps back down (snappiness).
+const RX_MIN_LEAD = 0.15, RX_MAX_LEAD = 0.5; // seconds
+let rxLead = RX_MIN_LEAD;
+
+function startRx(uid, rate) {
   if (playbackMode !== 'full') return;
-  if (!mime || !mime.includes('webm')) return;
-  if (!('MediaSource' in window)) return;
-  try { if (!MediaSource.isTypeSupported(mime)) return; } catch { return; }
-
+  if (!(rate >= 8000 && rate <= 96000)) return; // AudioBuffer's supported range
+  const ctx = getAudioCtx();
+  if (!ctx) return; // no Web Audio → fall back to playing the committed clip
   teardownRx(uid);
-  const ms = new MediaSource();
-  const audio = new Audio();
-  audio.src = URL.createObjectURL(ms);
-  const ctx = { ms, audio, sb: null, queue: [], open: false };
-  rxAudio.set(uid, ctx);
-
-  ms.addEventListener('sourceopen', () => {
-    try {
-      ctx.sb = ms.addSourceBuffer(mime);
-      ctx.open = true;
-      ctx.sb.addEventListener('updateend', () => flushRx(ctx));
-      flushRx(ctx);
-    } catch { /* codec rejected mid-stream; fallback clip will play on commit */ }
-  });
-  audio.play().catch(() => {}); // best-effort; page already has user interaction
+  rxLead = Math.max(RX_MIN_LEAD, rxLead * 0.9);
+  const gain = ctx.createGain();
+  gain.connect(ctx.destination);
+  rxAudio.set(uid, { gain, rate, nextTime: 0, started: false, pending: [] });
 }
 
-function pushRx(uid, base64) {
-  const ctx = rxAudio.get(uid);
-  if (!ctx || !base64) return;
-  ctx.queue.push(base64ToBytes(base64));
-  flushRx(ctx);
+// A binary WS frame arrived: [0x01][uidLen][uid utf8][Int16 PCM].
+const utf8 = new TextDecoder();
+function onLiveFrame(buf) {
+  const view = new Uint8Array(buf);
+  if (view.length < 4 || view[0] !== 0x01) return;
+  const uidLen = view[1];
+  if (view.length < 2 + uidLen + 2) return;
+  const rx = rxAudio.get(utf8.decode(view.subarray(2, 2 + uidLen)));
+  if (!rx) return; // not in full mode, or transmission already torn down
+
+  const pcm = new Int16Array(buf.slice(2 + uidLen)); // slice() realigns the odd offset
+  const ab = audioCtx.createBuffer(1, pcm.length, rx.rate);
+  const ch = ab.getChannelData(0);
+  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  __lc.framesHeard++;
+
+  if (rx.started) return scheduleRx(rx, ab);
+  // Pre-buffer until we're rxLead ahead, then release the backlog in one go.
+  rx.pending.push(ab);
+  let buffered = 0;
+  for (const b of rx.pending) buffered += b.duration;
+  if (buffered >= rxLead) flushPending(rx);
 }
 
-function flushRx(ctx) {
-  if (!ctx.open || !ctx.sb || ctx.sb.updating || !ctx.queue.length) return;
-  try { ctx.sb.appendBuffer(ctx.queue.shift()); } catch { /* buffer full / closed */ }
+function flushPending(rx) {
+  rx.started = true;
+  rx.nextTime = audioCtx.currentTime + 0.02;
+  for (const b of rx.pending) scheduleRx(rx, b);
+  rx.pending = [];
 }
 
-// Clip committed: let the buffered tail finish, then release the MediaSource.
+function scheduleRx(rx, buf) {
+  const now = audioCtx.currentTime;
+  if (rx.nextTime < now + 0.005) {
+    // Underrun: playback caught up with the network. Resume just ahead of "now" and
+    // remember to pre-buffer more on future transmissions.
+    if (rx.nextTime > 0) { rxLead = Math.min(rxLead * 1.5, RX_MAX_LEAD); __lc.underruns++; }
+    rx.nextTime = now + 0.05;
+  }
+  const src = audioCtx.createBufferSource();
+  src.buffer = buf;
+  src.connect(rx.gain);
+  src.start(rx.nextTime);
+  rx.nextTime += buf.duration;
+}
+
+// Clip committed: flush anything still pre-buffering (clips shorter than the jitter lead),
+// let the scheduled tail play out, then release the node.
 function finishRx(uid) {
-  const ctx = rxAudio.get(uid);
-  if (!ctx) return;
+  const rx = rxAudio.get(uid);
+  if (!rx) return;
   rxAudio.delete(uid);
-  ctx.audio.addEventListener('ended', () => { try { URL.revokeObjectURL(ctx.audio.src); } catch {} }, { once: true });
-  const end = () => { try { if (ctx.ms.readyState === 'open') ctx.ms.endOfStream(); } catch {} };
-  if (ctx.sb && ctx.sb.updating) ctx.sb.addEventListener('updateend', end, { once: true });
-  else end();
+  if (!rx.started && rx.pending.length) flushPending(rx);
+  const tail = audioCtx ? Math.max(0, rx.nextTime - audioCtx.currentTime) : 0;
+  setTimeout(() => { try { rx.gain.disconnect(); } catch {} }, (tail + 0.2) * 1000);
 }
 
 // Transmitter left/disconnected mid-clip: drop the live bubble + playback, no commit coming.
@@ -969,19 +1085,10 @@ function cancelTransmit(uid) {
 }
 
 function teardownRx(uid) {
-  const ctx = rxAudio.get(uid);
-  if (!ctx) return;
+  const rx = rxAudio.get(uid);
+  if (!rx) return;
   rxAudio.delete(uid);
-  try { ctx.audio.pause(); } catch {}
-  try { if (ctx.ms.readyState === 'open') ctx.ms.endOfStream(); } catch {}
-  try { URL.revokeObjectURL(ctx.audio.src); } catch {}
-}
-
-function base64ToBytes(b64) {
-  const bin = atob(b64);
-  const bytes = new Uint8Array(bin.length);
-  for (let i = 0; i < bin.length; i++) bytes[i] = bin.charCodeAt(i);
-  return bytes;
+  try { rx.gain.disconnect(); } catch {} // also silences any already-scheduled sources
 }
 
 // --- Toast ---
