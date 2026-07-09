@@ -973,32 +973,39 @@ function startLiveTx() {
       processorOptions: { targetRate: LIVE_RATE, frameSize: LIVE_FRAME }
     });
     if (txStepScale !== 1) node.port.postMessage({ type: 'stepScale', value: txStepScale });
-    // Self-calibration state: compare audio-seconds emitted to wall time. A healthy
-    // pipeline reads ~1.0; a stale-rate mic feed reads ~0.5 or ~2. Measured over TWO
-    // half-windows that must agree — a single main-thread stall inside one window would
-    // otherwise skew the ratio and persist a bogus correction (shipped once: caused
-    // works-sometimes garble). Corrects at most once per hold.
-    let firstFrameAt = 0, holdFrames = 0, halfFrames = 0, halfAt = 0, calibrated = false;
+    // Continuous self-calibration: compare audio-seconds emitted to wall time over rolling
+    // ~750 ms windows for the whole hold. A healthy pipeline reads ~1.0; a stale-rate mic
+    // feed reads ~0.5 or ~2 — and a previous one-shot correction can leave a few-percent
+    // residual that drains the listener's buffer into an underrun every few seconds, so
+    // small persistent drift matters too. A correction is applied only when TWO
+    // consecutive windows agree (same direction, within 25%) — a single main-thread stall
+    // would otherwise skew one window and persist a bogus correction.
+    let winStart = 0, winStartFrames = 0, prevRatio = 0;
+    const frameMs = LIVE_FRAME / LIVE_RATE * 1000;
     node.port.onmessage = (e) => {
       const frame = e.data; // Uint8Array of µ-law bytes
 
-      holdFrames++;
       const now = performance.now();
-      if (holdFrames === 1) firstFrameAt = now;
-      else if (!halfAt && now - firstFrameAt >= 450) { halfAt = now; halfFrames = holdFrames; }
-      else if (!calibrated && halfAt && now - firstFrameAt > 900) {
-        calibrated = true;
-        const frameMs = LIVE_FRAME / LIVE_RATE * 1000;
-        const r1 = (halfFrames - 1) * frameMs / (halfAt - firstFrameAt);
-        const r2 = (holdFrames - halfFrames) * frameMs / (now - halfAt);
-        __lc.txRatio = (r1 + r2) / 2;
-        const off = (r) => r < 0.85 || r > 1.18;
-        const agree = Math.abs(r1 - r2) < 0.25 * Math.max(r1, r2);
-        if (off(r1) && off(r2) && (r1 < 1) === (r2 < 1) && agree) {
-          txStepScale = Math.min(2.5, Math.max(0.4, txStepScale * (r1 + r2) / 2));
+      if (!winStart) { winStart = now; winStartFrames = 0; }
+      winStartFrames++;
+      if (now - winStart >= 750 && winStartFrames > 2) {
+        const ratio = (winStartFrames - 1) * frameMs / (now - winStart);
+        __lc.txRatio = ratio;
+        const off = (r) => r < 0.97 || r > 1.03;
+        if (prevRatio && off(ratio) && off(prevRatio) && (ratio < 1) === (prevRatio < 1) &&
+            Math.abs(ratio - prevRatio) < 0.25 * Math.max(ratio, prevRatio)) {
+          txStepScale = Math.min(2.5, Math.max(0.4, txStepScale * (ratio + prevRatio) / 2));
           node.port.postMessage({ type: 'stepScale', value: txStepScale });
           __lc.txStepScale = txStepScale;
+          __lc.txCal = (__lc.txCal || 0) + 1;
+          prevRatio = 0; // emission rate just changed; require a fresh agreeing pair
+        } else {
+          prevRatio = ratio;
         }
+        // This frame anchors the next window and counts as its first (the ratio divides
+        // frame INTERVALS by elapsed time, so the anchor must be included).
+        winStart = now;
+        winStartFrames = 1;
       }
 
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
@@ -1187,11 +1194,19 @@ function scheduleRx(rx, buf) {
     }
     rx.nextTime = now + rxLead;
   }
+  // Playout servo: steer the buffered backlog toward rxLead by playing up to ±3% fast or
+  // slow (inaudible for voice). Absorbs residual clock drift between sender and listener
+  // — even perfectly calibrated devices tick a little differently, and un-absorbed drift
+  // drains the buffer into an underrun every few seconds.
+  const backlog = rx.nextTime - now;
+  const rate = Math.max(0.97, Math.min(1.03, 1 + (backlog - rxLead) * 0.15));
+  __lc.rxRate = rate;
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
+  src.playbackRate.value = rate;
   src.connect(rx.gain);
   src.start(rx.nextTime);
-  rx.nextTime += buf.duration;
+  rx.nextTime += buf.duration / rate;
 }
 
 // Clip committed: flush anything still pre-buffering (clips shorter than the jitter lead),
