@@ -795,26 +795,38 @@ function getAudioCtx() {
   return audioCtx;
 }
 
-// Live playback routes through a persistent, gesture-unlocked <audio> element fed by a
-// MediaStreamAudioDestinationNode — NOT through ctx.destination. iOS mutes Web Audio's
-// output channel with the ring/silent switch, but media-element playback ignores the
-// switch — the same reason committed clips play through the unlocked `player` element.
-let liveDest = null; // all rx gains connect into this
-let liveOut = null;  // <audio> playing liveDest.stream (silence when nobody transmits)
+// iOS mutes Web Audio's output with the ring/silent switch UNLESS the page's audio
+// session is in playback mode — which any playing media element provides (observed
+// directly: live audio through ctx.destination was silent until a clip played through an
+// <audio> element, then worked). So a silent, looping "keeper" element holds the session
+// in playback mode from the first gesture on. Live playback itself stays on
+// ctx.destination — playing the live mix through a media element instead adds buffering
+// and glitch-loops the last chunk when the stream stalls between transmissions.
+let keeper = null;
 
-function getLiveDest() {
-  const ctx = getAudioCtx();
-  if (!ctx) return null;
-  if (!liveDest) {
-    try { liveDest = ctx.createMediaStreamDestination(); } catch { return null; }
-    liveOut = new Audio();
-    liveOut.setAttribute('playsinline', '');
-    liveOut.srcObject = liveDest.stream;
+function silentWavUrl(seconds = 1) {
+  const rate = 8000, n = rate * seconds;
+  const buf = new ArrayBuffer(44 + n), v = new DataView(buf);
+  const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
+  w(0, 'RIFF'); v.setUint32(4, 36 + n, true); w(8, 'WAVEfmt ');
+  v.setUint32(16, 16, true); v.setUint16(20, 1, true); v.setUint16(22, 1, true);
+  v.setUint32(24, rate, true); v.setUint32(28, rate, true); v.setUint16(32, 1, true);
+  v.setUint16(34, 8, true); w(36, 'data'); v.setUint32(40, n, true);
+  new Uint8Array(buf, 44).fill(0x80); // 8-bit PCM silence
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
+// Re-kick on every gesture and on each incoming transmission: needs a gesture once, and
+// iOS pauses the element when the audio session is interrupted (e.g. after recording).
+function keepSessionAlive() {
+  getAudioCtx();
+  if (!keeper) {
+    keeper = new Audio();
+    keeper.setAttribute('playsinline', '');
+    keeper.loop = true;
+    keeper.src = silentWavUrl();
   }
-  // (Re)start best-effort on every call: needs a gesture once, and iOS pauses the
-  // element when the audio session is interrupted.
-  liveOut.play().catch(() => {});
-  return liveDest;
+  if (keeper.paused) keeper.play().catch(() => {});
 }
 
 let micStream = null;
@@ -838,7 +850,7 @@ let playing = false;
 const SILENT_CLIP = 'data:audio/mp4;base64,AAAAHGZ0eXBNNEEgAAAAAE00QSBpc29tbXA0MgAAAAhmcmVlAAAAGm1kYXQAAAAA';
 let audioUnlocked = false;
 function unlockAudio() {
-  getLiveDest(); // create/resume the AudioContext + live output element during a gesture
+  keepSessionAlive(); // create/resume the AudioContext + keeper element during a gesture
   if (audioUnlocked) return;
   audioUnlocked = true;
   try {
@@ -1046,12 +1058,10 @@ function startRx(uid, rate) {
   const ctx = getAudioCtx();
   if (!ctx) return; // no Web Audio → fall back to playing the committed clip
   teardownRx(uid);
+  keepSessionAlive(); // best-effort: re-kick after an iOS audio-session interruption
   rxLead = Math.max(RX_MIN_LEAD, rxLead * 0.9);
   const gain = ctx.createGain();
-  // Through the media element (iOS silent switch mutes ctx.destination); direct only as
-  // a last resort.
-  const dest = getLiveDest();
-  gain.connect(dest || ctx.destination);
+  gain.connect(ctx.destination);
   rxAudio.set(uid, { gain, rate, nextTime: 0, started: false, pending: [] });
 }
 
