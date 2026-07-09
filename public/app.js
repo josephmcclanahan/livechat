@@ -781,11 +781,14 @@ const LIVE_FRAME = 960;  // samples per binary frame (60 ms at 16 kHz)
 const __lc = { framesSent: 0, framesHeard: 0, underruns: 0 };
 window.__lc = __lc;
 
-// One shared AudioContext drives live playback (capture gets its own per hold — see
-// startLiveTx). iOS creates it 'suspended' until a user gesture resumes it, and flips it
-// to 'interrupted' when the audio session changes (e.g. after a recording) — unlockAudio()
-// and startRx() both re-kick it.
+// ONE shared AudioContext drives both live capture and live playback. Capture must NOT
+// get its own context: a second context with no real output demand can receive render
+// callbacks faster than the mic delivers samples, so the media-stream source pads the
+// gaps with silence — heard as chopped audio on every platform. iOS creates the context
+// 'suspended' until a user gesture resumes it, and flips it to 'interrupted' when the
+// audio session changes (e.g. after a recording) — unlockAudio() and startRx() re-kick it.
 let audioCtx = null;
+let workletReady = null;
 
 function getAudioCtx() {
   const AC = window.AudioContext || window.webkitAudioContext;
@@ -793,6 +796,37 @@ function getAudioCtx() {
   if (!audioCtx) audioCtx = new AC();
   if (audioCtx.state !== 'running') audioCtx.resume().catch(() => {});
   return audioCtx;
+}
+
+function ensureWorklet() {
+  const ctx = getAudioCtx();
+  if (!ctx || !ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') return Promise.resolve(false);
+  if (!workletReady) {
+    workletReady = ctx.audioWorklet.addModule('pcm-capture-worklet.js').then(() => true, () => false);
+  }
+  return workletReady;
+}
+
+const IS_IOS = /iP(hone|ad|od)/.test(navigator.userAgent) ||
+  (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+
+// iOS re-configures the hardware sample rate when the mic session starts (48 kHz → 24 kHz
+// on some routes), but an AudioContext's rate is locked at creation and WebKit feeds mic
+// samples into a stale-rate context unresampled — captured audio then plays at the wrong
+// speed. Once the mic is live, rebuild the shared context if its rate doesn't match the
+// session (or can't be verified). iOS-only: on other platforms a track-vs-context rate
+// difference is normal and correctly resampled, and rebuilding would churn every hold.
+function syncCtxToMicSession() {
+  const ctx = getAudioCtx();
+  if (!ctx || !micStream) return;
+  const track = micStream.getAudioTracks()[0];
+  const trackRate = track && track.getSettings ? track.getSettings().sampleRate : undefined;
+  if (trackRate && trackRate === ctx.sampleRate) return;
+  for (const uid of [...rxAudio.keys()]) teardownRx(uid);
+  try { ctx.close(); } catch {}
+  audioCtx = null;
+  workletReady = null;
+  getAudioCtx(); // adopts the live session's rate; keeper's media session lets it start
 }
 
 // iOS mutes Web Audio's output with the ring/silent switch UNLESS the page's audio
@@ -903,7 +937,8 @@ async function startTransmit() {
   }
   if (!transmitting) { releaseMic(); return; } // released before permission resolved
 
-  const liveOk = await startLiveTx(); // builds the capture pipeline; false → clip-only
+  if (IS_IOS) syncCtxToMicSession();
+  const liveOk = await ensureWorklet(); // instant when the module is already loaded
   if (!transmitting) { releaseMic(); return; }
 
   wsSend({ type: 'ptt_start', mime: pttMime, live: liveOk, rate: LIVE_RATE });
@@ -933,27 +968,13 @@ async function startTransmit() {
   if (liveOk) startLiveTx();
 }
 
-// Mic → worklet (resample to LIVE_RATE Int16 frames) → binary WS frames. The worklet's
-// output is muted into the destination only to keep the graph pulled — nothing is audible
-// locally.
-//
-// Capture gets a FRESH AudioContext per hold, created only after getUserMedia resolves:
-// a context's sampleRate is locked at creation, but iOS re-configures the hardware rate
-// when the mic session starts (e.g. 48 kHz → 24 kHz on some routes). Capturing through a
-// context created before the mic ran means the worklet resamples from the wrong input
-// rate — audio arrives at half/double speed. Returns false if the live path is
-// unavailable (listeners then fall back to the committed clip).
-async function startLiveTx() {
-  if (!micStream) return false;
-  const AC = window.AudioContext || window.webkitAudioContext;
-  if (!AC) return false;
-  let ctx = null;
+// Mic → worklet (resample to LIVE_RATE Int16 frames) → binary WS frames, all on the
+// SHARED context. The worklet's output is muted into the destination only to keep the
+// graph pulled — nothing is audible locally.
+function startLiveTx() {
+  const ctx = getAudioCtx();
+  if (!ctx || !micStream) return;
   try {
-    ctx = new AC();
-    if (!ctx.audioWorklet || typeof AudioWorkletNode === 'undefined') throw new Error('no worklet');
-    if (ctx.state !== 'running') ctx.resume().catch(() => {});
-    await ctx.audioWorklet.addModule('pcm-capture-worklet.js');
-    if (!transmitting || !micStream) throw new Error('released during setup');
     const src = ctx.createMediaStreamSource(micStream);
     const node = new AudioWorkletNode(ctx, 'pcm-capture', {
       processorOptions: { targetRate: LIVE_RATE, frameSize: LIVE_FRAME }
@@ -972,12 +993,9 @@ async function startLiveTx() {
     src.connect(node);
     node.connect(mute);
     mute.connect(ctx.destination);
-    liveTx = { ctx, src, node, mute };
-    return true;
+    liveTx = { src, node, mute };
   } catch {
-    try { if (ctx) ctx.close(); } catch {}
-    liveTx = null;
-    return false;
+    liveTx = null; // listeners fall back to hearing the committed clip
   }
 }
 
@@ -987,7 +1005,6 @@ function stopLiveTx() {
   try { liveTx.src.disconnect(); } catch {}
   try { liveTx.node.disconnect(); } catch {}
   try { liveTx.mute.disconnect(); } catch {}
-  try { liveTx.ctx.close(); } catch {}
   liveTx = null;
 }
 
@@ -1098,6 +1115,9 @@ function flushPending(rx) {
 
 function scheduleRx(rx, buf) {
   const now = audioCtx.currentTime;
+  // A sender producing more audio than real time (e.g. a mis-clocked capture context)
+  // would otherwise push the backlog — and the listening delay — up without bound.
+  if (rx.nextTime - now > 1.5) return;
   if (rx.nextTime < now + 0.005) {
     // Underrun: playback caught up with the network. Resume just ahead of "now" and
     // remember to pre-buffer more on future transmissions.
