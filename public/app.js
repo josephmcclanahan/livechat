@@ -512,9 +512,13 @@ function appendMessage(msg, { scroll = true, live = false } = {}) {
   let shouldAutoplay = false;
   if (msg.type === 'audio') {
     // Auto-play on commit unless playback is off, it's our own clip, or we already heard it
-    // live. An open rx that never received a frame (sender's live path failed) doesn't count.
+    // live. An open rx that never received a frame (sender's live path failed) doesn't
+    // count — and neither do frames "played" into a context that isn't actually running
+    // (iOS interruption): they were inaudible, so the clip still auto-plays.
     const rx = rxAudio.get(msg.userId);
-    const playedLive = live && !!rx && (rx.started || rx.pending.length > 0);
+    const rxAudible = !!rx && (rx.started || rx.pending.length > 0) &&
+      !!audioCtx && audioCtx.state === 'running';
+    const playedLive = live && rxAudible;
     shouldAutoplay = playbackMode !== 'off' && live && !isMine && !playedLive;
     const dur = msg.duration ? `${msg.duration.toFixed(1)}s` : '';
     // Empty placeholder (hidden via :empty) that the async `transcript` event fills in.
@@ -778,7 +782,9 @@ const LIVE_RATE = 16000; // Hz — phone-call quality; ~32 KB/s upstream per tal
 const LIVE_FRAME = 960;  // samples per binary frame (60 ms at 16 kHz)
 
 // Live-path debug counters — inspect `__lc` from the console on a misbehaving device.
-const __lc = { framesSent: 0, framesHeard: 0, underruns: 0 };
+// framesDropped = shed by the talker on a congested uplink; txRatio/txStepScale = capture
+// rate calibration; rxLead = current jitter-buffer lead in seconds.
+const __lc = { framesSent: 0, framesHeard: 0, framesDropped: 0, underruns: 0 };
 window.__lc = __lc;
 
 // ONE shared AudioContext drives both live capture and live playback. Capture must NOT
@@ -928,7 +934,7 @@ async function startTransmit() {
   const liveOk = await ensureWorklet(); // instant when the module is already loaded
   if (!transmitting) { releaseMic(); return; }
 
-  wsSend({ type: 'ptt_start', mime: pttMime, live: liveOk, rate: LIVE_RATE });
+  wsSend({ type: 'ptt_start', mime: pttMime, live: liveOk, rate: LIVE_RATE, codec: 'ulaw' });
   txHadData = false;
   recorder = new MediaRecorder(micStream, { mimeType: pttMime });
   recorder.ondataavailable = (e) => {
@@ -967,31 +973,42 @@ function startLiveTx() {
       processorOptions: { targetRate: LIVE_RATE, frameSize: LIVE_FRAME }
     });
     if (txStepScale !== 1) node.port.postMessage({ type: 'stepScale', value: txStepScale });
-    let firstFrameAt = 0, holdFrames = 0, calibrated = false;
+    // Self-calibration state: compare audio-seconds emitted to wall time. A healthy
+    // pipeline reads ~1.0; a stale-rate mic feed reads ~0.5 or ~2. Measured over TWO
+    // half-windows that must agree — a single main-thread stall inside one window would
+    // otherwise skew the ratio and persist a bogus correction (shipped once: caused
+    // works-sometimes garble). Corrects at most once per hold.
+    let firstFrameAt = 0, holdFrames = 0, halfFrames = 0, halfAt = 0, calibrated = false;
     node.port.onmessage = (e) => {
-      const pcm = e.data; // Int16Array
+      const frame = e.data; // Uint8Array of µ-law bytes
 
-      // Self-calibration: after ~0.6s, compare audio-seconds emitted to wall time. A
-      // healthy pipeline reads ~1.0; a stale-rate mic feed reads ~0.5 or ~2. Correct the
-      // worklet's step once per hold and remember the scale for the next one.
       holdFrames++;
       const now = performance.now();
       if (holdFrames === 1) firstFrameAt = now;
-      else if (!calibrated && now - firstFrameAt > 600) {
+      else if (!halfAt && now - firstFrameAt >= 450) { halfAt = now; halfFrames = holdFrames; }
+      else if (!calibrated && halfAt && now - firstFrameAt > 900) {
         calibrated = true;
-        const ratio = ((holdFrames - 1) * LIVE_FRAME / LIVE_RATE * 1000) / (now - firstFrameAt);
-        __lc.txRatio = ratio;
-        if (ratio < 0.85 || ratio > 1.18) {
-          txStepScale = Math.min(2.5, Math.max(0.4, txStepScale * ratio));
+        const frameMs = LIVE_FRAME / LIVE_RATE * 1000;
+        const r1 = (halfFrames - 1) * frameMs / (halfAt - firstFrameAt);
+        const r2 = (holdFrames - halfFrames) * frameMs / (now - halfAt);
+        __lc.txRatio = (r1 + r2) / 2;
+        const off = (r) => r < 0.85 || r > 1.18;
+        const agree = Math.abs(r1 - r2) < 0.25 * Math.max(r1, r2);
+        if (off(r1) && off(r2) && (r1 < 1) === (r2 < 1) && agree) {
+          txStepScale = Math.min(2.5, Math.max(0.4, txStepScale * (r1 + r2) / 2));
           node.port.postMessage({ type: 'stepScale', value: txStepScale });
           __lc.txStepScale = txStepScale;
         }
       }
 
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
-      const out = new Uint8Array(1 + pcm.byteLength);
+      // Live audio over TCP must shed when behind, not queue: a slow uplink otherwise
+      // delays frames by seconds and every one arrives too late to play. The archive
+      // clip is lossless regardless.
+      if (ws.bufferedAmount > 12000) { __lc.framesDropped++; return; }
+      const out = new Uint8Array(1 + frame.length);
       out[0] = 0x01;
-      out.set(new Uint8Array(pcm.buffer, pcm.byteOffset, pcm.byteLength), 1);
+      out.set(frame, 1);
       ws.send(out);
       __lc.framesSent++;
     };
@@ -1050,7 +1067,7 @@ function blobToBase64(blob) {
 function onPttStart(msg) {
   if (msg.userId === userId) return;
   showTransmitBubble(msg.userId, msg.name);
-  if (msg.live && msg.rate) startRx(msg.userId, msg.rate);
+  if (msg.live && msg.rate) startRx(msg.userId, msg.rate, msg.codec);
 }
 
 function showTransmitBubble(uid, name) {
@@ -1076,7 +1093,7 @@ function showTransmitBubble(uid, name) {
 const RX_MIN_LEAD = 0.15, RX_MAX_LEAD = 0.5; // seconds
 let rxLead = RX_MIN_LEAD;
 
-function startRx(uid, rate) {
+function startRx(uid, rate, codec) {
   if (playbackMode !== 'full') return;
   if (!(rate >= 8000 && rate <= 96000)) return; // AudioBuffer's supported range
   const ctx = getAudioCtx();
@@ -1084,12 +1101,26 @@ function startRx(uid, rate) {
   teardownRx(uid);
   keepSessionAlive(); // best-effort: re-kick after an iOS audio-session interruption
   rxLead = Math.max(RX_MIN_LEAD, rxLead * 0.9);
+  __lc.rxLead = rxLead;
   const gain = ctx.createGain();
   gain.connect(ctx.destination);
-  rxAudio.set(uid, { gain, rate, nextTime: 0, started: false, pending: [] });
+  rxAudio.set(uid, { gain, rate, codec, nextTime: 0, started: false, pending: [] });
 }
 
-// A binary WS frame arrived: [0x01][uidLen][uid utf8][Int16 PCM].
+// G.711 µ-law byte → float sample, precomputed for the decode path.
+const ULAW_TABLE = (() => {
+  const t = new Float32Array(256);
+  for (let i = 0; i < 256; i++) {
+    const u = ~i & 0xff;
+    const sign = u & 0x80, exp = (u >> 4) & 7, mant = u & 0x0f;
+    const s = ((((mant << 3) + 132) << exp) - 132);
+    t[i] = (sign ? -s : s) / 32768;
+  }
+  return t;
+})();
+
+// A binary WS frame arrived: [0x01][uidLen][uid utf8][µ-law bytes] (Int16 if the talker
+// didn't advertise a codec).
 const utf8 = new TextDecoder();
 function onLiveFrame(buf) {
   const view = new Uint8Array(buf);
@@ -1099,10 +1130,18 @@ function onLiveFrame(buf) {
   const rx = rxAudio.get(utf8.decode(view.subarray(2, 2 + uidLen)));
   if (!rx) return; // not in full mode, or transmission already torn down
 
-  const pcm = new Int16Array(buf.slice(2 + uidLen)); // slice() realigns the odd offset
-  const ab = audioCtx.createBuffer(1, pcm.length, rx.rate);
-  const ch = ab.getChannelData(0);
-  for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  let ch;
+  if (rx.codec === 'ulaw') {
+    const bytes = view.subarray(2 + uidLen);
+    ch = new Float32Array(bytes.length);
+    for (let i = 0; i < bytes.length; i++) ch[i] = ULAW_TABLE[bytes[i]];
+  } else {
+    const pcm = new Int16Array(buf.slice(2 + uidLen)); // slice() realigns the odd offset
+    ch = new Float32Array(pcm.length);
+    for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
+  }
+  const ab = audioCtx.createBuffer(1, ch.length, rx.rate);
+  ab.getChannelData(0).set(ch);
   __lc.framesHeard++;
 
   if (rx.started) return scheduleRx(rx, ab);
@@ -1126,10 +1165,19 @@ function scheduleRx(rx, buf) {
   // would otherwise push the backlog — and the listening delay — up without bound.
   if (rx.nextTime - now > 1.5) return;
   if (rx.nextTime < now + 0.005) {
-    // Underrun: playback caught up with the network. Resume just ahead of "now" and
-    // remember to pre-buffer more on future transmissions.
-    if (rx.nextTime > 0) { rxLead = Math.min(rxLead * 1.5, RX_MAX_LEAD); __lc.underruns++; }
-    rx.nextTime = now + 0.05;
+    // Underrun: playback caught up with the network. Grow the lead and resume that far
+    // ahead — re-anchoring any tighter (e.g. a fixed 50 ms) leaves less headroom than the
+    // jitter that caused the underrun, and playback then underruns every couple of frames.
+    if (rx.nextTime > 0) {
+      rxLead = Math.min(rxLead * 1.5, RX_MAX_LEAD);
+      __lc.underruns++;
+      __lc.rxLead = rxLead;
+      if (!__lc.underrunLog) __lc.underrunLog = [];
+      if (__lc.underrunLog.length < 50) {
+        __lc.underrunLog.push({ frame: __lc.framesHeard, deficitMs: Math.round((now - rx.nextTime) * 1000) });
+      }
+    }
+    rx.nextTime = now + rxLead;
   }
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
