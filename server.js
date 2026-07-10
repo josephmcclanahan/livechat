@@ -218,8 +218,20 @@ app.get('/api/qos/:txId', (req, res) => {
 });
 
 // --- WebSocket ---
+// Heartbeat: clients that vanished without a FIN (network switch, sleep) otherwise stay
+// in `clients` as zombies — the relay wastes sends on them and stale identities linger.
+setInterval(() => {
+  for (const ws of clients.keys()) {
+    if (ws.isAlive === false) { ws.terminate(); continue; } // triggers 'close' cleanup
+    ws.isAlive = false;
+    try { ws.ping(); } catch {}
+  }
+}, 30000);
+
 wss.on('connection', (ws) => {
   clients.set(ws, { userId: null, name: null, channelId: null });
+  ws.isAlive = true;
+  ws.on('pong', () => { ws.isAlive = true; });
 
   ws.on('message', (data, isBinary) => {
     const client = clients.get(ws);
@@ -244,6 +256,12 @@ wss.on('connection', (ws) => {
       case 'identify': {
         client.userId = msg.userId;
         client.name = msg.name;
+        break;
+      }
+      case 'ping': {
+        // App-level liveness probe — clients use it to detect half-open sockets after a
+        // network switch (WiFi → cellular).
+        send(ws, { type: 'pong' });
         break;
       }
       case 'join': {

@@ -20,20 +20,52 @@ if (!userId) {
 }
 
 // --- WebSocket ---
+let reconnectTimer = null;
 function connectWS(onOpen) {
   const proto = location.protocol === 'https:' ? 'wss' : 'ws';
-  ws = new WebSocket(`${proto}://${location.host}`);
+  const sock = new WebSocket(`${proto}://${location.host}`);
+  ws = sock;
   ws.binaryType = 'arraybuffer'; // binary frames carry live PCM audio; JSON carries everything else
   ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'identify', userId, name: userName }));
+    sock.send(JSON.stringify({ type: 'identify', userId, name: userName }));
+    // Re-join the open room on reconnect — without this, a network blip (e.g. switching
+    // WiFi → cellular) left the app connected but silently receiving nothing.
+    if (currentChannelId) sock.send(JSON.stringify({ type: 'join', channelId: currentChannelId }));
     if (onOpen) onOpen();
   };
   ws.onmessage = (e) => {
+    // A superseded socket can still deliver queued events; processing them would double
+    // messages and live audio.
+    if (sock !== ws) { try { sock.close(); } catch {} return; }
     if (e.data instanceof ArrayBuffer) onLiveFrame(e.data);
     else handleMessage(JSON.parse(e.data));
   };
-  ws.onclose = () => setTimeout(() => connectWS(), 2000);
+  ws.onclose = () => {
+    if (sock !== ws) return; // an old socket closing must not clobber the live one
+    clearTimeout(reconnectTimer);
+    reconnectTimer = setTimeout(() => connectWS(), 2000);
+  };
 }
+
+// An interface switch (WiFi → cellular) kills the TCP connection without telling us —
+// the socket can sit half-open for minutes, claiming OPEN while delivering nothing, and
+// onclose never fires. Whenever the network or the page comes back, probe the socket
+// and force a reconnect if it's closed or fails to pong.
+let pongTimer = null;
+function kickWS() {
+  if (!ws) return;
+  clearTimeout(pongTimer);
+  if (ws.readyState === WebSocket.OPEN) {
+    try { ws.send(JSON.stringify({ type: 'ping' })); } catch {}
+    pongTimer = setTimeout(() => { try { ws.close(); } catch {} connectWS(); }, 4000);
+    return;
+  }
+  clearTimeout(reconnectTimer);
+  try { ws.close(); } catch {}
+  connectWS();
+}
+window.addEventListener('online', kickWS);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) kickWS(); });
 
 function wsSend(msg) {
   if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
@@ -46,6 +78,7 @@ function handleMessage(msg) {
     case 'channel_created': onChannelCreated(msg.channel); break;
     case 'channel_updated': onChannelUpdated(msg.channel); break;
     case 'channel_deleted': onChannelDeleted(msg.channelId); break;
+    case 'pong':         clearTimeout(pongTimer); break;
     case 'ptt_start':    onPttStart(msg); break;
     case 'ptt_cancel':   cancelTransmit(msg.userId); break;
     case 'transcript':   onTranscript(msg); break;
@@ -1232,7 +1265,7 @@ function startRx(uid, rate, codec, txId) {
   __lc.rxCodec = codec; // what the last live stream advertised — undefined means Int16
   const stats = {
     txId, t0: performance.now(), frames: 0, bytes: 0,
-    seqNext: -1, seqShed: 0, reorders: 0,
+    seqNext: -1, seqShed: 0, reorders: 0, dupes: 0,
     arriveGaps: [], lastArriveAt: 0, bursts: 0,
     underruns: 0, insertedGapMs: 0, lateDrops: 0,
     leadStart: rxLead, leadMax: rxLead,
@@ -1278,10 +1311,18 @@ function onLiveFrame(buf) {
   if (rx.txId) {
     const seq = view[payloadAt] | (view[payloadAt + 1] << 8);
     payloadAt += 2;
-    if (s.seqNext >= 0 && seq !== s.seqNext) {
+    if (s.seqNext >= 0) {
       const ahead = (seq - s.seqNext) & 0xffff;
-      if (ahead > 0 && ahead < 1000) s.seqShed += ahead;
-      else s.reorders++;
+      if (ahead > 0 && ahead < 1000) {
+        s.seqShed += ahead;
+      } else if (ahead >= 1000) {
+        // Behind the expected seq. TCP never reorders within a connection, so this frame
+        // was already played — duplicate delivery (e.g. a ghost socket). Scheduling it
+        // again doubles the audio and bloats the backlog; drop it. (Field data showed a
+        // listener receiving every frame twice: servo pinned at +3%, late-drops.)
+        s.dupes++;
+        return;
+      }
     }
     s.seqNext = (seq + 1) & 0xffff;
   }
@@ -1330,22 +1371,28 @@ function scheduleRx(rx, buf) {
   // would otherwise push the backlog — and the listening delay — up without bound.
   if (rx.nextTime - now > 1.5) { rx.stats.lateDrops++; return; }
   if (rx.nextTime < now + 0.005) {
-    // Underrun: playback caught up with the network. Grow the lead and resume that far
-    // ahead — re-anchoring any tighter (e.g. a fixed 50 ms) leaves less headroom than the
-    // jitter that caused the underrun, and playback then underruns every couple of frames.
+    // Underrun: playback caught up with the network. Grow the lead for future buffering,
+    // but resume proportionally to the deficit — field data showed a 10 ms blip inserting
+    // a full-lead 225 ms gap. Big stalls still get the whole (grown) lead of headroom;
+    // re-anchoring tighter than the jitter that caused the underrun cascades (shipped
+    // once as persistent garble), which is what the 60 ms floor guards against.
     if (rx.nextTime > 0) {
+      const deficit = Math.max(0, now - rx.nextTime);
       rxLead = Math.min(rxLead * 1.5, RX_MAX_LEAD);
       __lc.underruns++;
       __lc.rxLead = rxLead;
       if (!__lc.underrunLog) __lc.underrunLog = [];
       if (__lc.underrunLog.length < 50) {
-        __lc.underrunLog.push({ frame: __lc.framesHeard, deficitMs: Math.round((now - rx.nextTime) * 1000) });
+        __lc.underrunLog.push({ frame: __lc.framesHeard, deficitMs: Math.round(deficit * 1000) });
       }
+      const anchor = now + Math.min(rxLead, 0.06 + deficit);
       rx.stats.underruns++;
-      rx.stats.insertedGapMs += Math.round((now + rxLead - rx.nextTime) * 1000);
+      rx.stats.insertedGapMs += Math.round((anchor - rx.nextTime) * 1000);
       if (rxLead > rx.stats.leadMax) rx.stats.leadMax = rxLead;
+      rx.nextTime = anchor;
+    } else {
+      rx.nextTime = now + rxLead;
     }
-    rx.nextTime = now + rxLead;
   }
   // Playout servo: steer the buffered backlog toward rxLead by playing up to ±3% fast or
   // slow (inaudible for voice). Absorbs residual clock drift between sender and listener
@@ -1385,7 +1432,7 @@ function sendRxQos(rx, ended) {
   postQos({
     txId: s.txId, role: 'rx', user: userName, ua: navigator.userAgent,
     durMs: Math.round(performance.now() - s.t0),
-    frames: s.frames, bytes: s.bytes, seqShed: s.seqShed, reorders: s.reorders,
+    frames: s.frames, bytes: s.bytes, seqShed: s.seqShed, reorders: s.reorders, dupes: s.dupes,
     arriveGapMs: { p50: pctl(s.arriveGaps, 0.5), p95: pctl(s.arriveGaps, 0.95), max: pctl(s.arriveGaps, 1) },
     bursts: s.bursts,
     underruns: s.underruns, insertedGapMs: s.insertedGapMs, lateDrops: s.lateDrops,
