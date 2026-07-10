@@ -565,6 +565,34 @@ body {
   padding-top: 0.3rem;
 }
 .audio-transcript:empty { display: none; }
+
+/* Debug: per-message QoS link (visible when "Show voice QoS" is on in settings). */
+.qos-link {
+  align-self: flex-start;
+  font-size: 0.68rem;
+  color: #667;
+  background: rgba(0, 0, 0, 0.05);
+  border: none;
+  border-radius: 6px;
+  padding: 0.15rem 0.45rem;
+  cursor: pointer;
+}
+.qos-link:hover { background: rgba(0, 0, 0, 0.1); }
+
+.qos-modal { max-width: 34rem; }
+.qos-pre {
+  font-size: 0.68rem;
+  line-height: 1.35;
+  background: #f4f5f7;
+  border-radius: 8px;
+  padding: 0.6rem;
+  max-height: 55vh;
+  overflow: auto;
+  white-space: pre-wrap;
+  word-break: break-word;
+  user-select: text;
+  -webkit-user-select: text;
+}
 .message.mine .audio-bubble { background: #eef4ff; border-color: #cfe0ff; }
 .message.mine .audio-bubble .audio-dur { color: #5b6b8c; }
 .message.mine .audio-transcript { color: #3a4a66; border-top-color: rgba(0, 0, 0, 0.12); }
