@@ -110,6 +110,10 @@ function renderLayout() {
                 <input type="checkbox" id="voice-first-toggle" />
                 <span>Voice-first layout</span>
               </label>
+              <label class="profile-menu-check">
+                <input type="checkbox" id="show-qos-toggle" />
+                <span>Show voice QoS</span>
+              </label>
             </div>
           </div>
         </header>
@@ -180,6 +184,16 @@ function setupProfileMenu() {
   vf.addEventListener('change', () => {
     voiceFirst = vf.checked;
     renderComposer(); // re-render the current room's composer live
+  });
+
+  // Debug: a 📊 link on every voice bubble opens that message's QoS reports (capture +
+  // every live playback). Re-opens the room so existing bubbles gain/lose the link.
+  const qos = document.getElementById('show-qos-toggle');
+  qos.checked = showQos;
+  qos.addEventListener('change', () => {
+    showQos = qos.checked;
+    localStorage.setItem('showQos', showQos ? 'on' : 'off');
+    if (currentChannelId) openRoom(currentChannelId, currentChannelName);
   });
 }
 
@@ -525,6 +539,9 @@ function appendMessage(msg, { scroll = true, live = false } = {}) {
     const transcript = msg.transcript
       ? `<span class="audio-transcript">${escHtml(msg.transcript)}</span>`
       : '<span class="audio-transcript"></span>';
+    const qosLink = showQos && msg.txId
+      ? `<button class="qos-link" type="button" data-txid="${escHtml(msg.txId)}">📊 QoS</button>`
+      : '';
     div.innerHTML = `
       <span class="msg-name">${escHtml(msg.name)}</span>
       <span class="msg-text audio-bubble">
@@ -535,6 +552,7 @@ function appendMessage(msg, { scroll = true, live = false } = {}) {
           <audio preload="metadata" src="${escHtml(msg.url)}"></audio>
         </span>
         ${transcript}
+        ${qosLink}
       </span>
     `;
   } else {
@@ -564,6 +582,7 @@ function appendMessage(msg, { scroll = true, live = false } = {}) {
       if (row) row.innerHTML = '<span class="audio-error">⚠️ Voice clip can’t be played on this device</span>';
     });
     setupAudioPlayer(div, msg.duration);
+    div.querySelector('.qos-link')?.addEventListener('click', (e) => openQosModal(e.target.dataset.txid));
     // Let any live-streaming playback for this user finish/clean up now that the clip is committed.
     finishRx(msg.userId);
     // Auto-play through the shared, gesture-unlocked player (serialized — reliable on iOS).
@@ -787,6 +806,76 @@ const LIVE_FRAME = 960;  // samples per binary frame (60 ms at 16 kHz)
 const __lc = { framesSent: 0, framesHeard: 0, framesDropped: 0, underruns: 0 };
 window.__lc = __lc;
 
+// --- Voice QoS reporting ---
+// Every transmission carries a txId (in ptt_start, per-frame seq numbers, and the
+// committed message). Talker and every live listener each POST a per-stream report to
+// /api/qos on stream end, so one voice message correlates the capture experience with
+// every playback experience. Surfaced in the UI via the "Show voice QoS" setting.
+let showQos = localStorage.getItem('showQos') === 'on';
+
+function pctl(sortedSource, p) {
+  if (!sortedSource.length) return 0;
+  const s = [...sortedSource].sort((a, b) => a - b);
+  return Math.round(s[Math.min(s.length - 1, Math.floor(s.length * p))]);
+}
+
+function postQos(report) {
+  try {
+    fetch('/api/qos', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(report),
+      keepalive: true // survives the page closing right after a hold
+    }).catch(() => {});
+  } catch {}
+}
+
+// Shows every report for one voice message — the talker's capture report plus one
+// playback report per listener who heard it live — with a Copy button so the whole
+// bundle can be pasted into a bug report.
+function openQosModal(txId) {
+  document.getElementById('qos-modal')?.remove();
+  const overlay = document.createElement('div');
+  overlay.className = 'modal-overlay';
+  overlay.id = 'qos-modal';
+  overlay.innerHTML = `
+    <div class="modal qos-modal">
+      <h2>Voice QoS</h2>
+      <pre class="qos-pre">Loading…</pre>
+      <div class="modal-actions">
+        <button type="button" class="modal-cancel" id="qos-close">Close</button>
+        <button type="button" id="qos-copy">Copy</button>
+      </div>
+    </div>
+  `;
+  document.getElementById('app').appendChild(overlay);
+  const close = () => overlay.remove();
+  overlay.querySelector('#qos-close').addEventListener('click', close);
+  overlay.addEventListener('pointerdown', (e) => { if (e.target === overlay) close(); });
+
+  let payload = '';
+  fetch(`/api/qos/${encodeURIComponent(txId)}`)
+    .then(r => r.json())
+    .then(rows => {
+      const summary = rows.map(r => r.role === 'tx'
+        ? `🎙 ${r.user}: ${r.framesSent}/${r.framesEmitted} frames sent, ${r.framesShed} shed, ratio ${r.txRatio ? r.txRatio.toFixed(3) : '—'}`
+        : `🔊 ${r.user}: ${r.frames} frames, ${r.seqShed} shed upstream, ${r.underruns} underruns (${r.insertedGapMs}ms gaps), servo ${r.servo ? r.servo.mean : '—'}`
+      ).join('\n');
+      payload = JSON.stringify({ txId, thisDevice: { ...__lc, ua: navigator.userAgent }, reports: rows }, null, 2);
+      overlay.querySelector('.qos-pre').textContent =
+        (rows.length ? summary : 'No reports for this transmission (recorded before QoS existed, or reports not yet posted).') +
+        '\n\n' + payload;
+    })
+    .catch(() => { overlay.querySelector('.qos-pre').textContent = 'Failed to load QoS reports.'; });
+
+  overlay.querySelector('#qos-copy').addEventListener('click', () => {
+    navigator.clipboard?.writeText(payload).then(
+      () => showToast('QoS copied to clipboard'),
+      () => showToast('Copy failed')
+    );
+  });
+}
+
 // ONE shared AudioContext drives both live capture and live playback. Capture must NOT
 // get its own context: a second context with no real output demand can receive render
 // callbacks faster than the mic delivers samples, so the media-stream source pads the
@@ -934,7 +1023,8 @@ async function startTransmit() {
   const liveOk = await ensureWorklet(); // instant when the module is already loaded
   if (!transmitting) { releaseMic(); return; }
 
-  wsSend({ type: 'ptt_start', mime: pttMime, live: liveOk, rate: LIVE_RATE, codec: 'ulaw' });
+  const txId = crypto.randomUUID().slice(0, 8);
+  wsSend({ type: 'ptt_start', mime: pttMime, live: liveOk, rate: LIVE_RATE, codec: 'ulaw', txId });
   txHadData = false;
   recorder = new MediaRecorder(micStream, { mimeType: pttMime });
   recorder.ondataavailable = (e) => {
@@ -958,13 +1048,13 @@ async function startTransmit() {
   if (pttMime.includes('webm')) recorder.start(250);
   else recorder.start();
 
-  if (liveOk) startLiveTx();
+  if (liveOk) startLiveTx(txId);
 }
 
 // Mic → worklet (resample to LIVE_RATE Int16 frames) → binary WS frames, all on the
 // SHARED context. The worklet's output is muted into the destination only to keep the
 // graph pulled — nothing is audible locally.
-function startLiveTx() {
+function startLiveTx(txId) {
   const ctx = getAudioCtx();
   if (!ctx || !micStream) return;
   try {
@@ -973,6 +1063,12 @@ function startLiveTx() {
       processorOptions: { targetRate: LIVE_RATE, frameSize: LIVE_FRAME }
     });
     if (txStepScale !== 1) node.port.postMessage({ type: 'stepScale', value: txStepScale });
+    // Capture-side QoS: emission cadence (worklet→main gaps expose main-thread or context
+    // stalls), shed counts, and socket backpressure — reported to /api/qos on release.
+    const stats = {
+      txId, t0: performance.now(), emitted: 0, sent: 0, shed: 0,
+      maxBuffered: 0, emitGaps: [], lastEmitAt: 0, seq: 0
+    };
     // Continuous self-calibration: compare audio-seconds emitted to wall time over rolling
     // ~750 ms windows for the whole hold. A healthy pipeline reads ~1.0; a stale-rate mic
     // feed reads ~0.5 or ~2 — and a previous one-shot correction can leave a few-percent
@@ -986,6 +1082,9 @@ function startLiveTx() {
       const frame = e.data; // Uint8Array of µ-law bytes
 
       const now = performance.now();
+      stats.emitted++;
+      if (stats.lastEmitAt && stats.emitGaps.length < 4000) stats.emitGaps.push(now - stats.lastEmitAt);
+      stats.lastEmitAt = now;
       if (!winStart) { winStart = now; winStartFrames = 0; }
       winStartFrames++;
       if (now - winStart >= 750 && winStartFrames > 2) {
@@ -1009,22 +1108,29 @@ function startLiveTx() {
       }
 
       if (!ws || ws.readyState !== WebSocket.OPEN) return;
+      if (ws.bufferedAmount > stats.maxBuffered) stats.maxBuffered = ws.bufferedAmount;
+      // Every frame carries a sequence number (even shed ones burn one), so listeners can
+      // tell sender-shed gaps from their own underruns.
+      const seq = stats.seq++ & 0xffff;
       // Live audio over TCP must shed when behind, not queue: a slow uplink otherwise
       // delays frames by seconds and every one arrives too late to play. The archive
       // clip is lossless regardless.
-      if (ws.bufferedAmount > 12000) { __lc.framesDropped++; return; }
-      const out = new Uint8Array(1 + frame.length);
+      if (ws.bufferedAmount > 12000) { __lc.framesDropped++; stats.shed++; return; }
+      const out = new Uint8Array(3 + frame.length);
       out[0] = 0x01;
-      out.set(frame, 1);
+      out[1] = seq & 0xff;
+      out[2] = seq >> 8;
+      out.set(frame, 3);
       ws.send(out);
       __lc.framesSent++;
+      stats.sent++;
     };
     const mute = ctx.createGain();
     mute.gain.value = 0;
     src.connect(node);
     node.connect(mute);
     mute.connect(ctx.destination);
-    liveTx = { src, node, mute };
+    liveTx = { src, node, mute, stats };
   } catch {
     liveTx = null; // listeners fall back to hearing the committed clip
   }
@@ -1036,7 +1142,19 @@ function stopLiveTx() {
   try { liveTx.src.disconnect(); } catch {}
   try { liveTx.node.disconnect(); } catch {}
   try { liveTx.mute.disconnect(); } catch {}
+  const s = liveTx.stats;
   liveTx = null;
+  if (!s || !s.emitted) return;
+  postQos({
+    txId: s.txId, role: 'tx', user: userName, ua: navigator.userAgent,
+    holdMs: Math.round(performance.now() - s.t0),
+    audioMs: Math.round(s.emitted * LIVE_FRAME / LIVE_RATE * 1000),
+    framesEmitted: s.emitted, framesSent: s.sent, framesShed: s.shed,
+    maxBufferedKB: Math.round(s.maxBuffered / 1024),
+    emitGapMs: { p50: pctl(s.emitGaps, 0.5), p95: pctl(s.emitGaps, 0.95), max: pctl(s.emitGaps, 1) },
+    txRatio: __lc.txRatio, txStepScale, txCal: __lc.txCal || 0,
+    ctxRate: audioCtx ? audioCtx.sampleRate : 0
+  });
 }
 
 function stopTransmit() {
@@ -1074,7 +1192,7 @@ function blobToBase64(blob) {
 function onPttStart(msg) {
   if (msg.userId === userId) return;
   showTransmitBubble(msg.userId, msg.name);
-  if (msg.live && msg.rate) startRx(msg.userId, msg.rate, msg.codec);
+  if (msg.live && msg.rate) startRx(msg.userId, msg.rate, msg.codec, msg.txId);
 }
 
 function showTransmitBubble(uid, name) {
@@ -1100,7 +1218,7 @@ function showTransmitBubble(uid, name) {
 const RX_MIN_LEAD = 0.15, RX_MAX_LEAD = 0.5; // seconds
 let rxLead = RX_MIN_LEAD;
 
-function startRx(uid, rate, codec) {
+function startRx(uid, rate, codec, txId) {
   if (playbackMode !== 'full') return;
   if (!(rate >= 8000 && rate <= 96000)) return; // AudioBuffer's supported range
   const ctx = getAudioCtx();
@@ -1112,7 +1230,15 @@ function startRx(uid, rate, codec) {
   const gain = ctx.createGain();
   gain.connect(ctx.destination);
   __lc.rxCodec = codec; // what the last live stream advertised — undefined means Int16
-  rxAudio.set(uid, { gain, rate, codec, nextTime: 0, started: false, pending: [] });
+  const stats = {
+    txId, t0: performance.now(), frames: 0, bytes: 0,
+    seqNext: -1, seqShed: 0, reorders: 0,
+    arriveGaps: [], lastArriveAt: 0, bursts: 0,
+    underruns: 0, insertedGapMs: 0, lateDrops: 0,
+    leadStart: rxLead, leadMax: rxLead,
+    rateMin: 1, rateMax: 1, rateSum: 0, rateN: 0, pinned: 0
+  };
+  rxAudio.set(uid, { gain, rate, codec, txId, stats, nextTime: 0, started: false, pending: [] });
 }
 
 // G.711 µ-law byte → float sample, precomputed for the decode path.
@@ -1138,13 +1264,37 @@ function onLiveFrame(buf) {
   const rx = rxAudio.get(utf8.decode(view.subarray(2, 2 + uidLen)));
   if (!rx) return; // not in full mode, or transmission already torn down
 
+  // Streams with a txId carry a u16 sequence number ahead of the audio bytes — gaps mean
+  // the sender shed those frames (uplink congestion), distinct from local underruns.
+  let payloadAt = 2 + uidLen;
+  const s = rx.stats;
+  const now = performance.now();
+  if (s.lastArriveAt) {
+    const gap = now - s.lastArriveAt;
+    if (s.arriveGaps.length < 4000) s.arriveGaps.push(gap);
+    if (gap < 5) s.bursts++;
+  }
+  s.lastArriveAt = now;
+  if (rx.txId) {
+    const seq = view[payloadAt] | (view[payloadAt + 1] << 8);
+    payloadAt += 2;
+    if (s.seqNext >= 0 && seq !== s.seqNext) {
+      const ahead = (seq - s.seqNext) & 0xffff;
+      if (ahead > 0 && ahead < 1000) s.seqShed += ahead;
+      else s.reorders++;
+    }
+    s.seqNext = (seq + 1) & 0xffff;
+  }
+  s.frames++;
+  s.bytes += view.length;
+
   let ch;
   if (rx.codec === 'ulaw') {
-    const bytes = view.subarray(2 + uidLen);
+    const bytes = view.subarray(payloadAt);
     ch = new Float32Array(bytes.length);
     for (let i = 0; i < bytes.length; i++) ch[i] = ULAW_TABLE[bytes[i]];
   } else {
-    const pcm = new Int16Array(buf.slice(2 + uidLen)); // slice() realigns the odd offset
+    const pcm = new Int16Array(buf.slice(payloadAt)); // slice() realigns the odd offset
     ch = new Float32Array(pcm.length);
     for (let i = 0; i < pcm.length; i++) ch[i] = pcm[i] / 32768;
   }
@@ -1178,7 +1328,7 @@ function scheduleRx(rx, buf) {
   const now = audioCtx.currentTime;
   // A sender producing more audio than real time (e.g. a mis-clocked capture context)
   // would otherwise push the backlog — and the listening delay — up without bound.
-  if (rx.nextTime - now > 1.5) return;
+  if (rx.nextTime - now > 1.5) { rx.stats.lateDrops++; return; }
   if (rx.nextTime < now + 0.005) {
     // Underrun: playback caught up with the network. Grow the lead and resume that far
     // ahead — re-anchoring any tighter (e.g. a fixed 50 ms) leaves less headroom than the
@@ -1191,6 +1341,9 @@ function scheduleRx(rx, buf) {
       if (__lc.underrunLog.length < 50) {
         __lc.underrunLog.push({ frame: __lc.framesHeard, deficitMs: Math.round((now - rx.nextTime) * 1000) });
       }
+      rx.stats.underruns++;
+      rx.stats.insertedGapMs += Math.round((now + rxLead - rx.nextTime) * 1000);
+      if (rxLead > rx.stats.leadMax) rx.stats.leadMax = rxLead;
     }
     rx.nextTime = now + rxLead;
   }
@@ -1201,6 +1354,11 @@ function scheduleRx(rx, buf) {
   const backlog = rx.nextTime - now;
   const rate = Math.max(0.97, Math.min(1.03, 1 + (backlog - rxLead) * 0.15));
   __lc.rxRate = rate;
+  const s = rx.stats;
+  if (rate < s.rateMin) s.rateMin = rate;
+  if (rate > s.rateMax) s.rateMax = rate;
+  s.rateSum += rate; s.rateN++;
+  if (rate <= 0.97 || rate >= 1.03) s.pinned++;
   const src = audioCtx.createBufferSource();
   src.buffer = buf;
   src.playbackRate.value = rate;
@@ -1218,6 +1376,29 @@ function finishRx(uid) {
   if (!rx.started && rx.pending.length) flushPending(rx);
   const tail = audioCtx ? Math.max(0, rx.nextTime - audioCtx.currentTime) : 0;
   setTimeout(() => { try { rx.gain.disconnect(); } catch {} }, (tail + 0.2) * 1000);
+  sendRxQos(rx, 'commit');
+}
+
+function sendRxQos(rx, ended) {
+  const s = rx.stats;
+  if (!s || !s.txId || !s.frames) return;
+  postQos({
+    txId: s.txId, role: 'rx', user: userName, ua: navigator.userAgent,
+    durMs: Math.round(performance.now() - s.t0),
+    frames: s.frames, bytes: s.bytes, seqShed: s.seqShed, reorders: s.reorders,
+    arriveGapMs: { p50: pctl(s.arriveGaps, 0.5), p95: pctl(s.arriveGaps, 0.95), max: pctl(s.arriveGaps, 1) },
+    bursts: s.bursts,
+    underruns: s.underruns, insertedGapMs: s.insertedGapMs, lateDrops: s.lateDrops,
+    lead: { start: +s.leadStart.toFixed(3), end: +rxLead.toFixed(3), max: +s.leadMax.toFixed(3) },
+    servo: {
+      min: +s.rateMin.toFixed(4), max: +s.rateMax.toFixed(4),
+      mean: s.rateN ? +(s.rateSum / s.rateN).toFixed(4) : 1,
+      pinnedPct: s.rateN ? Math.round(100 * s.pinned / s.rateN) : 0
+    },
+    codec: rx.codec, rate: rx.rate,
+    ctxState: audioCtx ? audioCtx.state : 'none',
+    ended
+  });
 }
 
 // Transmitter left/disconnected mid-clip: drop the live bubble + playback, no commit coming.
@@ -1231,6 +1412,7 @@ function teardownRx(uid) {
   if (!rx) return;
   rxAudio.delete(uid);
   try { rx.gain.disconnect(); } catch {} // also silences any already-scheduled sources
+  sendRxQos(rx, 'cancel');
 }
 
 // --- Toast ---

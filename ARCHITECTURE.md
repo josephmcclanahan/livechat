@@ -59,6 +59,8 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | `PATCH` | `/api/channels/:id` | Edit a channel's settings; accepts either/both of `{ name, defaultMode }` (omitted fields unchanged, blank name → 400); broadcasts `channel_updated` to all WS clients |
 | `DELETE` | `/api/channels/:id` | Remove channel from list, delete its NDJSON file, broadcast `channel_deleted` to all WS clients |
 | `GET` | `/api/channels/:id/messages` | Return last 200 messages from NDJSON file |
+| `POST` | `/api/qos` | Append a voice QoS report (validated `txId` + `role: 'tx'\|'rx'`, ≤8 KB) to `qos.ndjson` |
+| `GET` | `/api/qos/:txId` | All QoS reports for one transmission — the talker's capture report plus one playback report per live listener |
 
 ### WebSocket Protocol
 
@@ -71,10 +73,10 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | `leave` | — | Clear client's channel; broadcast empty draft to clear their row for others |
 | `draft` | `{ text }` | Update `drafts` map; broadcast `draft_update` to channel (excluding sender) |
 | `send` | `{ text }` | Append message to NDJSON; broadcast `message` to channel; clear draft |
-| `ptt_start` | `{ mime, live, rate, codec }` | Begin a voice transmission; init transmit buffer; broadcast `ptt_start` to channel (excluding sender). `live`/`rate`/`codec` advertise the talker's live stream (absent if the browser lacks AudioWorklet); `codec` is `ulaw` (Int16 assumed if missing) |
+| `ptt_start` | `{ mime, live, rate, codec, txId }` | Begin a voice transmission; init transmit buffer; broadcast `ptt_start` to channel (excluding sender). `live`/`rate`/`codec` advertise the talker's live stream (absent if the browser lacks AudioWorklet); `codec` is `ulaw` (Int16 assumed if missing); `txId` correlates QoS reports and lands on the committed message |
 | `ptt_chunk` | `{ data }` | Base64 **archive** chunk (MediaRecorder output); append to the transmit buffer only — never relayed |
 | `ptt_end` | — | Assemble buffer → write `media/<id>.<ext>`; append `audio` row; broadcast `message`; kick off async `transcribeClip` |
-| *(binary frame)* | `[0x01][µ-law bytes]` | Live audio frame (mono, `rate` Hz, ~60 ms). Relayed to the channel with the sender's userId spliced in; never parsed or persisted. Dropped unless a transmission is open; capped at 32 KB |
+| *(binary frame)* | `[0x01][seq:u16][µ-law bytes]` | Live audio frame (mono, `rate` Hz, ~60 ms). `seq` increments per frame — shed frames burn one too, so listeners can tell sender-side shedding from their own underruns. Relayed to the channel with the sender's userId spliced in; never parsed or persisted. Dropped unless a transmission is open; capped at 32 KB |
 | `delete_message` | `{ id }` | Delete that message **only if it belongs to the sender** (`removeOwnMessage`); rewrites the channel NDJSON without it (+ its transcript row), unlinks the media file, broadcasts `message_deleted` |
 
 **Server → Client**
@@ -87,7 +89,7 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | `channel_updated` | `{ channel: { id, name, defaultMode, createdAt } }` | When any client edits a channel's settings |
 | `channel_deleted` | `{ channelId }` | When any client deletes a channel |
 | `ptt_start` | `{ userId, name, mime, live, rate }` | Another user began transmitting — show live bubble; if `live`, open a jitter-buffered Web Audio stream at `rate` Hz |
-| *(binary frame)* | `[0x01][uidLen:u8][uid utf8][µ-law bytes]` | Live audio frame relayed from a transmitter — decode the uid header, decode µ-law per the stream's advertised `codec`, schedule into that talker's stream |
+| *(binary frame)* | `[0x01][uidLen:u8][uid utf8][seq:u16][µ-law bytes]` | Live audio frame relayed from a transmitter — decode the uid header, track `seq` gaps, decode µ-law per the stream's advertised `codec`, schedule into that talker's stream |
 | `ptt_cancel` | `{ userId }` | Transmitter left/disconnected mid-clip, or the recording captured no audio — tear down live bubble + playback, no commit coming |
 | `transcript` | `{ id, text }` | A clip's transcript (from server-side Azure AI Speech) — patch it under the matching `#msg-<id>` bubble |
 | `message_deleted` | `{ id }` | Remove the `#msg-<id>` bubble for everyone |
@@ -100,6 +102,7 @@ Live audio rides as raw binary WebSocket frames — no base64 (~33% smaller, no 
 data/channels.json          → JSON array, read/written atomically with fs.writeFileSync
 data/messages/<id>.ndjson   → append-only, one JSON line per message via fs.appendFileSync
 data/media/<id>.webm|.mp4   → one audio file per completed transmission via fs.writeFileSync
+data/qos.ndjson             → append-only voice QoS reports, keyed by txId
 ```
 
 On startup, `data/`, `data/messages/`, and `data/media/` are created if missing. `channels.json` is initialized to `[]` if absent.
@@ -193,6 +196,7 @@ Voice runs as **two pipelines off one mic stream** — the live stream and the d
 - **Transcript** — server-side (see `transcribeClip` in `server.js`). After a clip commits, the server POSTs the saved file to Azure AI Speech "fast transcription"; on success it appends a `transcript` row and broadcasts `transcript`. The client's `onTranscript` patches the text into `#msg-<id> .audio-transcript` (with a brief retry in case it beats the bubble). No client speech code — works on every browser/device, in-tenant.
 - **Live indicator** — `ptt_start` renders a `draft-${userId}` "🔴 transmitting…" bubble reusing the exact draft-bubble mechanism; the committed `audio` message swaps it in-place via the existing `replaceChild` path.
 - **Cleanup** — `finishRx` flushes any still-pre-buffering frames (clips shorter than the jitter lead), lets the scheduled tail play out, then disconnects the talker's gain node; `ptt_cancel` (transmitter left mid-clip) disconnects it immediately and removes the bubble.
+- **Voice QoS** — every transmission gets a `txId` (in `ptt_start`, per-frame `seq` numbers, and the committed message). On stream end, the talker POSTs a capture report (frames emitted/sent/shed, emission-gap percentiles, backpressure high-water, calibration trail) and each live listener POSTs a playback report (frames, upstream-shed vs local underruns, arrival-gap percentiles, inserted gap time, lead/servo stats) to `/api/qos`. The **Show voice QoS** setting puts a 📊 link on every voice bubble that fetches all reports for that message — capture + every playback — with a copy button for bug reports.
 - **Playback mode setting** — the profile menu (`setupProfileMenu`) sets `playbackMode` (persisted in `localStorage`, default `'full'`):
   - `'full'` → `startRx` opens a live stream (when the talker advertises one); commit doesn't re-play. A stream that never delivered a frame falls back to auto-play on commit.
   - `'onfinish'` → `startRx` returns early (no live stream); the committed clip auto-plays on release.

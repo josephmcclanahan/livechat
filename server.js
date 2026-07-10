@@ -191,6 +191,32 @@ app.get('/api/channels/:id/messages', (req, res) => {
   res.json(readMessages(req.params.id));
 });
 
+// --- Voice QoS ---
+// Talker and each live listener POST a per-transmission report keyed by txId; rows for
+// one txId correlate the capture experience with every playback experience of the same
+// voice message. Surfaced in the client via the "Show voice QoS" setting.
+const QOS_FILE = path.join(DATA_DIR, 'qos.ndjson');
+
+app.post('/api/qos', (req, res) => {
+  const r = req.body;
+  if (!r || typeof r.txId !== 'string' || !/^[\w-]{1,32}$/.test(r.txId) ||
+      (r.role !== 'tx' && r.role !== 'rx')) {
+    return res.status(400).json({ error: 'Bad report' });
+  }
+  const line = JSON.stringify({ ts: new Date().toISOString(), ...r });
+  if (line.length > 8192) return res.status(413).json({ error: 'Report too large' });
+  fs.appendFileSync(QOS_FILE, line + '\n');
+  res.json({ ok: true });
+});
+
+app.get('/api/qos/:txId', (req, res) => {
+  if (!/^[\w-]{1,32}$/.test(req.params.txId) || !fs.existsSync(QOS_FILE)) return res.json([]);
+  const rows = fs.readFileSync(QOS_FILE, 'utf8').split('\n').filter(Boolean)
+    .map(l => { try { return JSON.parse(l); } catch { return null; } })
+    .filter(r => r && r.txId === req.params.txId);
+  res.json(rows);
+});
+
 // --- WebSocket ---
 wss.on('connection', (ws) => {
   clients.set(ws, { userId: null, name: null, channelId: null });
@@ -273,6 +299,8 @@ wss.on('connection', (ws) => {
         client.audioChunks = [];
         client.audioMime = msg.mime || 'audio/webm';
         client.audioStart = Date.now();
+        // Correlates the committed message with the /api/qos reports for this transmission.
+        client.audioTxId = typeof msg.txId === 'string' && /^[\w-]{1,32}$/.test(msg.txId) ? msg.txId : undefined;
         // live/rate advertise the talker's PCM stream so listeners can schedule it; a
         // client without a live path (no AudioWorklet) omits them and listeners just
         // wait for the committed clip.
@@ -281,7 +309,8 @@ wss.on('connection', (ws) => {
           live: !!msg.live, rate: Number(msg.rate) || 0,
           // Listeners decode frames per this codec — dropping it here once made them read
           // µ-law bytes as Int16 PCM (ear-splitting noise).
-          codec: typeof msg.codec === 'string' ? msg.codec.slice(0, 16) : undefined
+          codec: typeof msg.codec === 'string' ? msg.codec.slice(0, 16) : undefined,
+          txId: client.audioTxId
         }, ws);
         break;
       }
@@ -307,6 +336,7 @@ wss.on('connection', (ws) => {
         fs.writeFileSync(filePath, Buffer.concat(chunks));
         const message = {
           id,
+          txId: client.audioTxId,
           type: 'audio',
           userId: client.userId,
           name: client.name,
