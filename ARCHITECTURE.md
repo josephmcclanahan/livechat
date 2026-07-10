@@ -69,6 +69,7 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 | `type` | Payload | Effect |
 |--------|---------|--------|
 | `identify` | `{ userId, name }` | Register the connection in `clients` |
+| `ping` | — | App-level liveness probe; server replies `pong`. Clients use it to detect half-open sockets after a network switch |
 | `join` | `{ channelId }` | Set client's active channel; flush current drafts for that channel to them |
 | `leave` | — | Clear client's channel; broadcast empty draft to clear their row for others |
 | `draft` | `{ text }` | Update `drafts` map; broadcast `draft_update` to channel (excluding sender) |
@@ -83,13 +84,14 @@ Both are ephemeral — reset on server restart. Drafts and in-flight audio buffe
 
 | `type` | Payload | When |
 |--------|---------|------|
+| `pong` | — | Reply to a client `ping` |
 | `draft_update` | `{ userId, name, text }` | On every `draft`; `text: ""` signals removal |
 | `message` | `{ message: { id, userId, name, text, timestamp } }` or `{ message: { id, type:'audio', userId, name, url, mime, duration, timestamp } }` | When a text message is sent or a voice clip is committed |
 | `channel_created` | `{ channel: { id, name, defaultMode, createdAt } }` | When any client creates a channel |
 | `channel_updated` | `{ channel: { id, name, defaultMode, createdAt } }` | When any client edits a channel's settings |
 | `channel_deleted` | `{ channelId }` | When any client deletes a channel |
 | `ptt_start` | `{ userId, name, mime, live, rate }` | Another user began transmitting — show live bubble; if `live`, open a jitter-buffered Web Audio stream at `rate` Hz |
-| *(binary frame)* | `[0x01][uidLen:u8][uid utf8][seq:u16][µ-law bytes]` | Live audio frame relayed from a transmitter — decode the uid header, track `seq` gaps, decode µ-law per the stream's advertised `codec`, schedule into that talker's stream |
+| *(binary frame)* | `[0x01][uidLen:u8][uid utf8][seq:u16][µ-law bytes]` | Live audio frame relayed from a transmitter — decode the uid header, track `seq` gaps, decode µ-law per the stream's advertised `codec`, schedule into that talker's stream. Behind-seq frames are **dropped as duplicates** (TCP never reorders within a connection; field data showed a ghost socket double-delivering every frame) |
 | `ptt_cancel` | `{ userId }` | Transmitter left/disconnected mid-clip, or the recording captured no audio — tear down live bubble + playback, no commit coming |
 | `transcript` | `{ id, text }` | A clip's transcript (from server-side Azure AI Speech) — patch it under the matching `#msg-<id>` bubble |
 | `message_deleted` | `{ id }` | Remove the `#msg-<id>` bubble for everyone |
@@ -189,7 +191,7 @@ Voice runs as **two pipelines off one mic stream** — the live stream and the d
 - **Self-calibrating capture rate** — the worklet's resample step assumes mic samples arrive at the context's rate, which breaks on iOS: the hardware rate changes when the mic session starts (e.g. 48 kHz → 24 kHz on some routes) while the context's rate stays locked at creation — listeners hear wrong-speed, underrun-choppy audio. Don't model this (rebuilding the context mid-hold corrupts MediaRecorder's clip; a fresh capture-only context free-runs and chops audio — both shipped, both reverted). Instead the main thread **measures** emitted-audio-seconds against the wall clock over rolling ~750 ms windows for the whole hold, and posts a `stepScale` correction whenever **two consecutive windows agree** the ratio is off by more than ±3 % (agreement guards against a main-thread stall skewing one window; continuous refinement stops a noisy first correction from leaving a permanent few-percent residual). The learned scale (`txStepScale`, corrections counted in `txCal`) persists across holds, so only the first hold on a new route drifts briefly; drift below the trigger is the playout servo's job.
 - **Receive (live)** — `rxAudio` is a `Map<userId, rx>`; on a `ptt_start` with `live`, `startRx` creates a per-talker `GainNode` in the shared `AudioContext`. Each binary frame is demuxed by its uid header, converted to an `AudioBuffer`, and **scheduled back-to-back on the AudioContext clock** (`nextTime`). Simultaneous talkers each get their own node — full-duplex with zero extra coordination.
 - **Silent "keeper" element** — iOS mutes Web Audio output with the ring/silent switch *unless* the page's audio session is in playback mode, which any playing media element provides (symptom: live audio silent until some clip played through an `<audio>` element, then fine). A silent, looping keeper `<audio>` (a runtime-generated 1 s WAV) starts on the first gesture and holds the session open, so rx audio plays straight from `ctx.destination`. Don't route the live mix through a media element via `MediaStreamAudioDestinationNode` instead — the element buffering degrades quality and WebKit glitch-loops the last chunk when the live stream stalls between transmissions. `keepSessionAlive()` re-kicks the keeper on every gesture and incoming transmission, since iOS pauses it across audio-session interruptions (e.g. after recording).
-- **Jitter buffer (smoothness ↔ snappiness)** — playback starts once `rxLead` (150 ms floor) of audio is pre-buffered. On underrun mid-stream, `rxLead` grows ×1.5 (capped at 500 ms) and playback resumes **that far** ahead of "now" — re-anchoring tighter than the jitter that caused the underrun makes playback underrun every couple of frames (shipped once as persistent garble). Each healthy new transmission decays the lead ×0.9 back toward the floor. A **playout servo** steers the backlog toward `rxLead` by scheduling each buffer up to ±3 % fast/slow (inaudible for voice): sender and listener clocks always drift a little, and un-absorbed drift drains the buffer into a glitch every few seconds. Debug state lives on `window.__lc` (`framesSent/Heard/Dropped`, `underruns`, `underrunLog`, `rxLead`, `rxRate`, `rxCodec`, `txRatio`, `txStepScale`, `txCal`).
+- **Jitter buffer (smoothness ↔ snappiness)** — playback starts once `rxLead` (150 ms floor) of audio is pre-buffered. On underrun mid-stream, `rxLead` grows ×1.5 (capped at 500 ms) and playback resumes **proportionally to the deficit** (60 ms floor, capped at the grown lead) — a 10 ms blip shouldn't insert a 225 ms gap, but re-anchoring tighter than the jitter that caused the underrun makes playback underrun every couple of frames (shipped once as persistent garble). Each healthy new transmission decays the lead ×0.9 back toward the floor. A **playout servo** steers the backlog toward `rxLead` by scheduling each buffer up to ±3 % fast/slow (inaudible for voice): sender and listener clocks always drift a little, and un-absorbed drift drains the buffer into a glitch every few seconds. Debug state lives on `window.__lc` (`framesSent/Heard/Dropped`, `underruns`, `underrunLog`, `rxLead`, `rxRate`, `rxCodec`, `txRatio`, `txStepScale`, `txCal`).
 - **Receive (fallback)** — if the talker advertised no live stream (no AudioWorklet) or the listener lacks Web Audio, the committed clip **auto-plays on release** instead — same behavior every browser had before, now only a fallback. A committed clip whose codec the device can't decode shows a "can't be played on this device" fallback instead of a broken player.
 - **Audio unlock + serial queue** — iOS only permits audio from a recent user gesture and blocks/queues a fresh `<audio>` each time (symptom: first clip plays, later ones don't, then all flush at once on the next gesture). So auto-play routes through **one persistent `player` element**, unlocked on the first `pointerdown`/PTT hold (`unlockAudio()` plays a silent clip on it — and also creates/resumes the shared `AudioContext` and starts the `liveOut` element while the gesture is live), and a FIFO `playQueue` (`enqueuePlay`/`playNext`) plays clips one-at-a-time. The per-bubble hidden `<audio>` (driven by `setupAudioPlayer`) is still there for manual replay.
 - **Space-to-talk** — `setupSpacePtt()` makes holding the **Space** bar push-to-talk (when not typing in a field and in a channel), routing to the same `startTransmit`/`stopTransmit`.
@@ -217,8 +219,14 @@ function connectWS(onOpen) {
     ws.send(JSON.stringify({ type: 'identify', userId, name: userName }))
     if (onOpen) onOpen()
   }
-  ws.onclose = () => setTimeout(() => connectWS(), 2000)  // simple reconnect
+  ws.onclose = () => setTimeout(() => connectWS(), 2000)  // reconnect; onopen re-joins the room
 }
+// Reconnects re-send `join` for the open room (a blip otherwise left the app silently
+// receiving nothing), and superseded sockets' events are ignored (they'd double messages
+// and live audio). `kickWS()` — wired to window 'online' and visibilitychange — probes a
+// suspect socket with app-level ping/pong and forces a reconnect if it's half-open, which
+// is what a WiFi → cellular switch produces. Server side, a 30 s ws-protocol heartbeat
+// terminates zombie connections so the relay list stays clean.
 
 function handleMessage(msg) {
   switch (msg.type) {
