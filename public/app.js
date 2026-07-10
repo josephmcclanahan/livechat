@@ -1245,11 +1245,15 @@ function showTransmitBubble(uid, name) {
   scrollHistory();
 }
 
-// Jitter buffer: hold this much audio before starting playback. Adaptive — grows when the
-// network stalls mid-stream (smoothness), decays a little on each healthy new transmission
-// so latency creeps back down (snappiness).
-const RX_MIN_LEAD = 0.15, RX_MAX_LEAD = 0.5; // seconds
+// Jitter buffer: hold this much audio before starting playback. Adaptive — grows toward
+// the size of the stalls it sees (smoothness on a jittery uplink like cellular), and
+// tightens back toward the floor once streams play clean (snappiness on good links). The
+// cap is high so a second-long cellular stall can be buffered over rather than dropped;
+// it's only reached after real underruns, and the latency it costs is only paid on a bad
+// connection — where smooth-but-late beats choppy, and the committed clip lands regardless.
+const RX_MIN_LEAD = 0.15, RX_MAX_LEAD = 1.2; // seconds
 let rxLead = RX_MIN_LEAD;
+let lastRxUnderran = false; // did the previous live stream underrun? gates the lead decay
 
 function startRx(uid, rate, codec, txId) {
   if (playbackMode !== 'full') return;
@@ -1258,7 +1262,9 @@ function startRx(uid, rate, codec, txId) {
   if (!ctx) return; // no Web Audio → fall back to playing the committed clip
   teardownRx(uid);
   keepSessionAlive(); // best-effort: re-kick after an iOS audio-session interruption
-  rxLead = Math.max(RX_MIN_LEAD, rxLead * 0.9);
+  // Tighten toward snappy only when the previous stream played clean; hold the grown lead
+  // on a still-bad connection so this stream pre-buffers deep enough to ride its stalls.
+  if (!lastRxUnderran) rxLead = Math.max(RX_MIN_LEAD, rxLead * 0.8);
   __lc.rxLead = rxLead;
   const gain = ctx.createGain();
   gain.connect(ctx.destination);
@@ -1368,8 +1374,9 @@ function flushPending(rx) {
 function scheduleRx(rx, buf) {
   const now = audioCtx.currentTime;
   // A sender producing more audio than real time (e.g. a mis-clocked capture context)
-  // would otherwise push the backlog — and the listening delay — up without bound.
-  if (rx.nextTime - now > 1.5) { rx.stats.lateDrops++; return; }
+  // would otherwise push the backlog — and the listening delay — up without bound. The
+  // ceiling sits above RX_MAX_LEAD so a legitimately deep buffer + a burst isn't clipped.
+  if (rx.nextTime - now > RX_MAX_LEAD + 0.75) { rx.stats.lateDrops++; return; }
   if (rx.nextTime < now + 0.005) {
     // Underrun: playback caught up with the network. Grow the lead for future buffering,
     // but resume proportionally to the deficit — field data showed a 10 ms blip inserting
@@ -1378,7 +1385,12 @@ function scheduleRx(rx, buf) {
     // once as persistent garble), which is what the 60 ms floor guards against.
     if (rx.nextTime > 0) {
       const deficit = Math.max(0, now - rx.nextTime);
-      rxLead = Math.min(rxLead * 1.5, RX_MAX_LEAD);
+      // Grow toward the stall we just saw so the next similar one is covered — a fixed
+      // ×1.5 creep never catches a cellular link whose stalls run 300ms–1s+. Half the
+      // deficit + a margin, clamped to the cap; combined with the ×1.5 it still climbs
+      // over repeated stalls but a single multi-second freak can't be fully chased.
+      const target = Math.min(RX_MAX_LEAD, deficit * 0.5 + 0.15);
+      rxLead = Math.min(RX_MAX_LEAD, Math.max(rxLead * 1.5, target));
       __lc.underruns++;
       __lc.rxLead = rxLead;
       if (!__lc.underrunLog) __lc.underrunLog = [];
@@ -1429,6 +1441,8 @@ function finishRx(uid) {
 function sendRxQos(rx, ended) {
   const s = rx.stats;
   if (!s || !s.txId || !s.frames) return;
+  lastRxUnderran = s.underruns > 0; // gates whether the next stream tightens the lead
+
   postQos({
     txId: s.txId, role: 'rx', user: userName, ua: navigator.userAgent,
     durMs: Math.round(performance.now() - s.t0),
